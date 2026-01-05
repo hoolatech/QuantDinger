@@ -85,8 +85,11 @@ jobs:
       - name: Install dependencies
         working-directory: ./quantdinger_vue
         run: |
-          npm ci
-          # Use npm ci for faster, reliable, reproducible builds in CI.
+          # Project uses yarn (as specified in package.json packageManager field)
+          # Enable corepack to use the correct yarn version
+          corepack enable
+          yarn install --frozen-lockfile
+          # Use --frozen-lockfile to ensure reproducible builds and fail if lockfile is out of sync
 
       - name: Frontend lint check
         working-directory: ./quantdinger_vue
