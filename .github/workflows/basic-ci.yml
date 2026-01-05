@@ -92,9 +92,10 @@ jobs:
           # Project uses yarn (as specified in package.json packageManager field)
           # Enable corepack to use the correct yarn version
           corepack enable
-          yarn install --frozen-lockfile
-          # Use --frozen-lockfile to ensure reproducible builds and fail if lockfile is out of sync
-          # HUSKY=0 prevents husky install from running (not needed in CI)
+          # IMPORTANT: skip lifecycle scripts in CI to avoid running `prepare` (husky install),
+          # which fails because `.git` is not present in GitHub Actions checkouts by default.
+          yarn install --frozen-lockfile --ignore-scripts
+          # Use --frozen-lockfile for reproducible installs. Use --ignore-scripts to keep CI non-intrusive.
 
       - name: Frontend lint check
         working-directory: ./quantdinger_vue
