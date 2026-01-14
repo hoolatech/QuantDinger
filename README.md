@@ -53,7 +53,7 @@
 
 ### What is QuantDinger?
 
-QuantDinger is a **local-first, privacy-first quantitative trading infrastructure**. It runs entirely on your machine, giving you full control over your strategies, trading data, and API keys.
+QuantDinger is a **local-first, privacy-first, self-hosted quantitative trading infrastructure**. It runs on your own machine/server, providing **multi-user accounts backed by PostgreSQL** while keeping full control of your strategies, trading data, and API keys.
 
 ### Why Local-First?
 
@@ -73,77 +73,11 @@ QuantDinger includes a built-in **LLM-based multi-agent research system** that g
 
 ### Core Value
 
-- **🔓 Apache 2.0 Open Source**: Fully permissive and commercial-friendly. Unlike viral licenses (GPL/AGPL), you truly own your code and modifications.
+- **🔓 Apache 2.0 Open Source (Code)**: Permissive and commercial-friendly. You can fork and modify the codebase under Apache 2.0, while preserving required notices.
 - **🐍 Python-Native & Visual**: Write indicators in standard Python (easier than PineScript) with AI assistance. Visualize signals directly on charts—a "Local TradingView" experience.
 - **🤖 AI-Loop Optimization**: It doesn't just run strategies; AI analyzes backtest results to suggest parameter tuning (Stop-Loss/TP/MACD settings), forming a closed optimization loop.
 - **🌍 Universal Market Access**: One unified system for Crypto (Live), US/CN Stocks, Forex, and Futures (Data/Notify).
 - **⚡ Docker & Clean Arch**: 4-line command deployment. Modern Tech Stack (Vue + Python) with a clean, separation-of-concerns architecture.
-
----
-
-## 🏆 Our Partners & Sponsors
-
-<div align="center">
-
-### 💼 Trusted Exchange Partners
-
-We're proud to partner with leading cryptocurrency exchanges that provide reliable infrastructure for quantitative trading. These partnerships help support the ongoing development of QuantDinger.
-
-<table>
-  <tr>
-    <td align="center" width="33.33%">
-      <a href="https://www.bmwweb.ac/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_9OSOJ" target="_blank">
-        <img src="https://img.shields.io/badge/Binance-Exchange-F0B90B?style=for-the-badge&logo=binance&logoColor=white" alt="Binance" />
-      </a>
-      <br/><br/>
-      <strong>World's Largest Crypto Exchange</strong><br/>
-      <small>Spot • Futures • Margin Trading</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://www.bjwebptyiou.com/join/14449926" target="_blank">
-        <img src="https://img.shields.io/badge/OKX-Exchange-000000?style=for-the-badge&logo=okx&logoColor=white" alt="OKX" />
-      </a>
-      <br/><br/>
-      <strong>Leading Derivatives Platform</strong><br/>
-      <small>Spot • Perpetual • Options</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://share.glassgs.com/u/H8XZGS71" target="_blank">
-        <img src="https://img.shields.io/badge/Bitget-Exchange-1F2937?style=for-the-badge&logo=bitget&logoColor=white" alt="Bitget" />
-      </a>
-      <br/><br/>
-      <strong>Innovative Copy Trading</strong><br/>
-      <small>Spot • Futures • Social Trading</small>
-    </td>
-  </tr>
-</table>
-
-<p align="center">
-  <em>By using our partner links, you support QuantDinger's development while enjoying the same trading experience.</em>
-</p>
-
----
-
-### 💝 Direct Support
-
-Your contributions help us maintain and improve QuantDinger. Every donation makes a difference!
-
-**Crypto Donations (ERC-20 / BEP-20 / Polygon / Arbitrum)**
-
-```
-0x96fa4962181bea077f8c7240efe46afbe73641a7
-```
-
-<p>
-  <img src="https://img.shields.io/badge/USDT-Accepted-26A17B?style=for-the-badge&logo=tether&logoColor=white" alt="USDT">
-  <img src="https://img.shields.io/badge/ETH-Accepted-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white" alt="ETH">
-</p>
-
-<p align="center">
-  <em>Thank you for supporting open-source development! 🙏</em>
-</p>
-
-</div>
 
 ---
 
@@ -479,8 +413,8 @@ POSTGRES_PASSWORD=your_secure_password
 POSTGRES_DB=quantdinger
 
 # Admin Account (created on first startup)
-ADMIN_USER=admin
-ADMIN_PASSWORD=your_admin_password
+ADMIN_USER=quantdinger
+ADMIN_PASSWORD=123456
 
 # Optional: AI Features
 OPENROUTER_API_KEY=your_api_key
@@ -515,7 +449,7 @@ This will automatically:
 
 - **Frontend UI**: http://localhost:8888
 - **Backend API**: http://localhost:5000
-- **Default Account**: Uses `ADMIN_USER` / `ADMIN_PASSWORD` from `.env` (default: `quantdinger` / `123456`)
+- **Default Account**: Uses `ADMIN_USER` / `ADMIN_PASSWORD` from `.env` (default: `quantdinger` / `123456`, please change for production)
 
 > **Note**: For production, edit `backend_api_python/.env` to set strong passwords, add `OPENROUTER_API_KEY` for AI features, then restart with `docker-compose restart backend`.
 
@@ -744,8 +678,8 @@ Edit `.env` and set:
 ```bash
 DATABASE_URL=postgresql://quantdinger:your_password@localhost:5432/quantdinger
 SECRET_KEY=your-secret-key
-ADMIN_USER=admin
-ADMIN_PASSWORD=your_admin_password
+ADMIN_USER=quantdinger
+ADMIN_PASSWORD=123456
 ```
 
 Then start:
@@ -810,24 +744,82 @@ Licensed under the **Apache License 2.0**. See `LICENSE`.
 
 ---
 
-## 💰 Project Sustainability
+## 💼 Commercial License & Sponsorship
 
-QuantDinger is open-source and free to use. If you find it useful, here are ways to support ongoing development:
+QuantDinger is licensed under **Apache License 2.0** (code). However, **Apache 2.0 does NOT grant trademark rights**. Our branding assets (name/logo) are protected as trademarks and are governed separately from the code license:
 
-### Professional Services
+- **Copyright/Attribution**: You must keep required copyright and license notices (including any NOTICE/attribution in the repo and in the UI where applicable).
+- **Trademarks (Name/Logo/Branding)**: You may not use the QuantDinger name/logo/branding to imply endorsement or misrepresent origin. If you redistribute a modified version, you should remove/replace QuantDinger branding unless you have written permission.
 
-Professional services are available:
+If you need to keep/modify QuantDinger branding in a redistribution (including UI branding and logo usage), please contact us for a **commercial license**.
 
-| Service | Description |
-|---------|-------------|
-| **Deployment & Setup** | One-on-one assistance with server deployment, configuration, and optimization |
-| **Custom Strategy Development** | Tailored trading strategies designed for your specific needs and markets |
-| **Enterprise Upgrade** | Commercial license, priority support, and advanced features for businesses |
-| **Training & Consulting** | Hands-on training sessions and strategic consulting for your trading team |
+See: `TRADEMARKS.md`
 
-**Interested?** Contact us via:
-- 📧 Email: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
-- 💬 Telegram: [QuantDinger Group](https://t.me/quantdinger)
+### What you get with a Commercial License
+
+- **Commercial authorization** to modify branding/copyright display as agreed
+- **Operations support**: deployment, upgrades, incident support, and maintenance guidance
+- **Consulting services**: architecture review, performance tuning, strategy workflow consulting
+- **Sponsorship options**: become a project sponsor and we can **display your logo/ad** (README/website/in-app placement as agreed)
+
+### Contact
+
+- **Telegram**: [QuantDinger Group](https://t.me/quantdinger)
+- **Email**: [brokermr810@gmail.com](mailto:brokermr810@gmail.com)
+
+---
+
+### 💼 Trusted Exchange Partners (Affiliate Links)
+
+By using our partner links, you support QuantDinger's development while enjoying the same trading experience.
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="33.33%">
+      <a href="https://www.bmwweb.ac/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_9OSOJ" target="_blank">
+        <img src="https://img.shields.io/badge/Binance-Exchange-F0B90B?style=for-the-badge&logo=binance&logoColor=white" alt="Binance" />
+      </a>
+      <br/><br/>
+      <strong>World's Largest Crypto Exchange</strong><br/>
+      <small>Spot • Futures • Margin Trading</small>
+    </td>
+    <td align="center" width="33.33%">
+      <a href="https://www.bjwebptyiou.com/join/14449926" target="_blank">
+        <img src="https://img.shields.io/badge/OKX-Exchange-000000?style=for-the-badge&logo=okx&logoColor=white" alt="OKX" />
+      </a>
+      <br/><br/>
+      <strong>Leading Derivatives Platform</strong><br/>
+      <small>Spot • Perpetual • Options</small>
+    </td>
+    <td align="center" width="33.33%">
+      <a href="https://share.glassgs.com/u/H8XZGS71" target="_blank">
+        <img src="https://img.shields.io/badge/Bitget-Exchange-1F2937?style=for-the-badge&logo=bitget&logoColor=white" alt="Bitget" />
+      </a>
+      <br/><br/>
+      <strong>Innovative Copy Trading</strong><br/>
+      <small>Spot • Futures • Social Trading</small>
+    </td>
+  </tr>
+</table>
+</div>
+
+---
+
+### 💝 Direct Support (Donations)
+
+Your contributions help us maintain and improve QuantDinger.
+
+**Crypto Donations (ERC-20 / BEP-20 / Polygon / Arbitrum)**
+
+```
+0x96fa4962181bea077f8c7240efe46afbe73641a7
+```
+
+<p>
+  <img src="https://img.shields.io/badge/USDT-Accepted-26A17B?style=for-the-badge&logo=tether&logoColor=white" alt="USDT">
+  <img src="https://img.shields.io/badge/ETH-Accepted-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white" alt="ETH">
+</p>
 
 ---
 
