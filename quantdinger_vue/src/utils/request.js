@@ -3,12 +3,15 @@ import axios from 'axios'
 import storage from 'store'
 import notification from 'ant-design-vue/es/notification'
 import { VueAxios } from './axios'
-import { ACCESS_TOKEN } from '@/store/mutation-types'
+import { ACCESS_TOKEN, USER_INFO, USER_ROLES } from '@/store/mutation-types'
 
 // PHPSESSID 存储键名
 const PHPSESSID_KEY = 'PHPSESSID'
 // Locale storage key used by vue-i18n (see src/locales/index.js)
 const LOCALE_KEY = 'lang'
+
+// Prevent multiple concurrent 401 redirects
+let isRedirectingToLogin = false
 
 /**
  * 获取 token，处理 token 可能是字符串或对象的情况
@@ -53,16 +56,28 @@ const errorHandler = (error) => {
       })
     }
     if (error.response.status === 401 && !(data.result && data.result.isLogin)) {
-      notification.error({
-        message: 'Unauthorized',
-        description: 'Authorization verification failed'
-      })
-      // 不清理本地 token，避免刷新后丢失登录态；仅跳转到登录页
-      // 项目使用 hash 模式，需要跳转到 /#/user/login
-      const curHash = window.location.hash || ''
-      if (!curHash.includes('/user/login')) {
-        const redirect = encodeURIComponent(curHash.replace('#', '') || '/')
-        window.location.assign(`/#/user/login?redirect=${redirect}`)
+      // Token invalid/expired: MUST clear local auth state, otherwise route guard will
+      // detect a stale token and immediately bounce user away from login page.
+      if (!isRedirectingToLogin) {
+        isRedirectingToLogin = true
+        try {
+          storage.remove(ACCESS_TOKEN)
+          storage.remove(USER_INFO)
+          storage.remove(USER_ROLES)
+          storage.remove(PHPSESSID_KEY)
+        } catch (e) {}
+
+        notification.error({
+          message: 'Unauthorized',
+          description: data.msg || data.message || 'Token invalid or expired, please login again.'
+        })
+
+        // 项目使用 hash 模式，需要跳转到 /#/user/login
+        const curHash = window.location.hash || ''
+        if (!curHash.includes('/user/login')) {
+          const redirect = encodeURIComponent(curHash.replace('#', '') || '/')
+          window.location.assign(`/#/user/login?redirect=${redirect}`)
+        }
       }
     }
   }

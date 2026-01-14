@@ -67,7 +67,17 @@ router.beforeEach((to, from, next) => {
               }
             })
           })
-          .catch(() => {
+          .catch((err) => {
+            // If token is invalid/expired, clear local auth and redirect to login.
+            const status = err && err.response && err.response.status
+            if (status === 401) {
+              store.dispatch('Logout').finally(() => {
+                next({ path: loginRoutePath, query: { redirect: to.fullPath } })
+                NProgress.done()
+              })
+              return
+            }
+
             // Do NOT hard-logout on transient failures (backend down, proxy issue, etc).
             // Instead, degrade gracefully with a default role and continue.
             store.commit('SET_ROLES', [{ id: 'default', permissionList: [] }])
