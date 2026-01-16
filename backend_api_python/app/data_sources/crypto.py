@@ -160,7 +160,8 @@ class CryptoDataSource(BaseDataSource):
                     last_timestamp = batch[-1][0]
                     
                     # 如果最后一条数据时间超过了结束时间，或者返回数据少于请求量，说明已经获取完毕
-                    if last_timestamp >= end_ms or len(batch) < batch_limit:
+                    # if last_timestamp >= end_ms or len(batch) < batch_limit:
+                    if last_timestamp >= end_ms:
                         break
                     
                     # 下次从最后一条的下一个时间点开始
