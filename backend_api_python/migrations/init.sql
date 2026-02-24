@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS qd_users (
     email_verified BOOLEAN DEFAULT FALSE,  -- 邮箱是否已验证
     referred_by INTEGER,                   -- 邀请人ID
     notification_settings TEXT DEFAULT '', -- 用户通知配置 JSON (telegram_chat_id, default_channels等)
+    token_version INTEGER DEFAULT 1,       -- Token版本号，用于单一客户端登录控制
     last_login_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
@@ -161,6 +162,18 @@ CREATE INDEX IF NOT EXISTS idx_strategies_user_id ON qd_strategies_trading(user_
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON qd_strategies_trading(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_group_id ON qd_strategies_trading(strategy_group_id);
 
+-- Add last_rebalance_at column for cross-sectional strategies (if not exists)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_strategies_trading' AND column_name = 'last_rebalance_at'
+    ) THEN
+        ALTER TABLE qd_strategies_trading ADD COLUMN last_rebalance_at TIMESTAMP;
+        RAISE NOTICE 'Added last_rebalance_at column to qd_strategies_trading';
+    END IF;
+END $$;
+
 -- =============================================================================
 -- 3. Strategy Positions
 -- =============================================================================
@@ -275,46 +288,40 @@ CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON qd_strategy_notification
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_indicator_codes (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
-    is_buy INTEGER NOT NULL DEFAULT 0,
-    end_time BIGINT NOT NULL DEFAULT 1,
-    name VARCHAR(255) NOT NULL DEFAULT '',
-    code TEXT,
-    description TEXT DEFAULT '',
-    publish_to_community INTEGER NOT NULL DEFAULT 0,
-    pricing_type VARCHAR(20) NOT NULL DEFAULT 'free',
-    price DECIMAL(10,2) NOT NULL DEFAULT 0,
-    is_encrypted INTEGER NOT NULL DEFAULT 0,
-    preview_image VARCHAR(500) DEFAULT '',
-    createtime BIGINT,
-    updatetime BIGINT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
+   id serial4 NOT NULL,
+   user_id int4 DEFAULT 1 NOT NULL,
+   is_buy int4 DEFAULT 0 NOT NULL,
+   end_time int8 DEFAULT 1 NOT NULL,
+   name varchar(255) DEFAULT ''::character varying NOT NULL,
+   code text NULL,
+   description text DEFAULT ''::text NULL,
+   publish_to_community int4 DEFAULT 0 NOT NULL,
+   pricing_type varchar(20) DEFAULT 'free'::character varying NOT NULL,
+   price numeric(10, 2) DEFAULT 0 NOT NULL,
+   is_encrypted int4 DEFAULT 0 NOT NULL,
+   preview_image varchar(500) DEFAULT ''::character varying NULL,
+   createtime int8 NULL,
+   updatetime int8 NULL,
+   created_at timestamp DEFAULT now(),
+   updated_at timestamp DEFAULT now(),
+   purchase_count int4 DEFAULT 0 NULL,
+   avg_rating numeric(3, 2) DEFAULT 0 NULL,
+   rating_count int4 DEFAULT 0 NULL,
+   view_count int4 DEFAULT 0 NULL,
+   review_status varchar(20) DEFAULT 'approved'::character varying NULL,
+   review_note text DEFAULT ''::text NULL,
+   reviewed_at timestamp NULL,
+   reviewed_by int4 NULL,
+   CONSTRAINT qd_indicator_codes_pkey PRIMARY KEY (id),
+   CONSTRAINT qd_indicator_codes_user_id_fkey FOREIGN KEY (user_id) REFERENCES qd_users(id) ON DELETE CASCADE
+
 );
 
-CREATE INDEX IF NOT EXISTS idx_indicator_codes_user_id ON qd_indicator_codes(user_id);
+CREATE INDEX IF NOT EXISTS idx_indicator_codes_user_id ON qd_indicator_codes USING btree (user_id);
+CREATE INDEX IF NOT EXISTS idx_indicator_review_status ON qd_indicator_codes USING btree (review_status);
 
 -- =============================================================================
--- 8. Strategy Codes
--- =============================================================================
-
-CREATE TABLE IF NOT EXISTS qd_strategy_codes (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
-    name VARCHAR(255) NOT NULL DEFAULT '',
-    code TEXT,
-    description TEXT DEFAULT '',
-    createtime BIGINT,
-    updatetime BIGINT,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_strategy_codes_user_id ON qd_strategy_codes(user_id);
-
--- =============================================================================
--- 9. AI Decisions
+-- 8. AI Decisions
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_ai_decisions (
@@ -329,7 +336,7 @@ CREATE TABLE IF NOT EXISTS qd_ai_decisions (
 CREATE INDEX IF NOT EXISTS idx_ai_decisions_user_id ON qd_ai_decisions(user_id);
 
 -- =============================================================================
--- 10. Addon Config
+-- 9. Addon Config
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_addon_config (
@@ -339,7 +346,7 @@ CREATE TABLE IF NOT EXISTS qd_addon_config (
 );
 
 -- =============================================================================
--- 11. Watchlist
+-- 10. Watchlist
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_watchlist (
@@ -356,7 +363,7 @@ CREATE TABLE IF NOT EXISTS qd_watchlist (
 CREATE INDEX IF NOT EXISTS idx_watchlist_user_id ON qd_watchlist(user_id);
 
 -- =============================================================================
--- 12. Analysis Tasks
+-- 11. Analysis Tasks
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_analysis_tasks (
@@ -376,7 +383,7 @@ CREATE TABLE IF NOT EXISTS qd_analysis_tasks (
 CREATE INDEX IF NOT EXISTS idx_analysis_tasks_user_id ON qd_analysis_tasks(user_id);
 
 -- =============================================================================
--- 13. Backtest Runs
+-- 12. Backtest Runs
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_backtest_runs (
@@ -404,7 +411,7 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_id ON qd_backtest_runs(user_id
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_indicator_id ON qd_backtest_runs(indicator_id);
 
 -- =============================================================================
--- 14. Exchange Credentials
+-- 13. Exchange Credentials
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_exchange_credentials (
@@ -421,7 +428,7 @@ CREATE TABLE IF NOT EXISTS qd_exchange_credentials (
 CREATE INDEX IF NOT EXISTS idx_exchange_credentials_user_id ON qd_exchange_credentials(user_id);
 
 -- =============================================================================
--- 15. Manual Positions
+-- 14. Manual Positions
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_manual_positions (
@@ -445,7 +452,7 @@ CREATE TABLE IF NOT EXISTS qd_manual_positions (
 CREATE INDEX IF NOT EXISTS idx_manual_positions_user_id ON qd_manual_positions(user_id);
 
 -- =============================================================================
--- 16. Position Alerts
+-- 15. Position Alerts
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_position_alerts (
@@ -471,7 +478,7 @@ CREATE INDEX IF NOT EXISTS idx_position_alerts_user_id ON qd_position_alerts(use
 CREATE INDEX IF NOT EXISTS idx_position_alerts_position_id ON qd_position_alerts(position_id);
 
 -- =============================================================================
--- 17. Position Monitors
+-- 16. Position Monitors
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_position_monitors (
@@ -494,7 +501,7 @@ CREATE TABLE IF NOT EXISTS qd_position_monitors (
 CREATE INDEX IF NOT EXISTS idx_position_monitors_user_id ON qd_position_monitors(user_id);
 
 -- =============================================================================
--- 18. Market Symbols (Seed Data)
+-- 17. Market Symbols (Seed Data)
 -- =============================================================================
 
 CREATE TABLE IF NOT EXISTS qd_market_symbols (
@@ -585,7 +592,7 @@ INSERT INTO qd_market_symbols (market, symbol, name, exchange, currency, is_acti
 ON CONFLICT (market, symbol) DO NOTHING;
 
 -- =============================================================================
--- 19. Agent Memories (AI Learning System)
+-- 18. Agent Memories (AI Learning System)
 -- =============================================================================
 -- Stores agent decision experiences for RAG-style retrieval during analysis.
 -- Each agent (trader, risk_analyst, etc.) shares this table but is identified by agent_name.
@@ -611,7 +618,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_memories_created ON qd_agent_memories(agent
 CREATE INDEX IF NOT EXISTS idx_agent_memories_market ON qd_agent_memories(agent_name, market, symbol);
 
 -- =============================================================================
--- 20. Reflection Records (AI Auto-Verification System)
+-- 19. Reflection Records (AI Auto-Verification System)
 -- =============================================================================
 -- Records analysis predictions for future auto-verification and closed-loop learning.
 
@@ -633,6 +640,144 @@ CREATE TABLE IF NOT EXISTS qd_reflection_records (
 
 CREATE INDEX IF NOT EXISTS idx_reflection_status ON qd_reflection_records(status, target_check_date);
 CREATE INDEX IF NOT EXISTS idx_reflection_market ON qd_reflection_records(market, symbol);
+
+-- =============================================================================
+-- 19.5. Analysis Memory (Fast AI Analysis Memory System)
+-- =============================================================================
+-- Stores AI analysis results for history, feedback, and learning.
+
+CREATE TABLE IF NOT EXISTS qd_analysis_memory (
+    id SERIAL PRIMARY KEY,
+    user_id INT,                                -- User who created this analysis (for filtering)
+    market VARCHAR(50) NOT NULL,
+    symbol VARCHAR(50) NOT NULL,
+    decision VARCHAR(10) NOT NULL,
+    confidence INT DEFAULT 50,
+    price_at_analysis DECIMAL(24, 8),
+    entry_price DECIMAL(24, 8),
+    stop_loss DECIMAL(24, 8),
+    take_profit DECIMAL(24, 8),
+    summary TEXT,
+    reasons JSONB,
+    risks JSONB,
+    scores JSONB,
+    indicators_snapshot JSONB,
+    raw_result JSONB,                           -- Full analysis result for history replay
+    created_at TIMESTAMP DEFAULT NOW(),
+    validated_at TIMESTAMP,
+    actual_outcome VARCHAR(20),
+    actual_return_pct DECIMAL(10, 4),
+    was_correct BOOLEAN,
+    user_feedback VARCHAR(20),                  -- helpful/not_helpful
+    feedback_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_memory_symbol ON qd_analysis_memory(market, symbol);
+CREATE INDEX IF NOT EXISTS idx_analysis_memory_created ON qd_analysis_memory(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_analysis_memory_validated ON qd_analysis_memory(validated_at) WHERE validated_at IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_analysis_memory_user ON qd_analysis_memory(user_id);
+
+-- Migration: Add user_id column to existing qd_analysis_memory table
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_analysis_memory' AND column_name = 'user_id'
+    ) THEN
+        ALTER TABLE qd_analysis_memory ADD COLUMN user_id INT;
+        CREATE INDEX IF NOT EXISTS idx_analysis_memory_user ON qd_analysis_memory(user_id);
+        RAISE NOTICE 'Added user_id column to qd_analysis_memory';
+    END IF;
+END $$;
+
+-- =============================================================================
+-- 20. Migration: Add token_version for single-client login
+-- =============================================================================
+-- This migration adds token_version column for enforcing single-client login.
+-- When a user logs in from a new device, the token_version is incremented,
+-- invalidating all previous tokens and forcing other sessions to logout.
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_users' AND column_name = 'token_version'
+    ) THEN
+        ALTER TABLE qd_users ADD COLUMN token_version INTEGER DEFAULT 1;
+        RAISE NOTICE 'Added token_version column to qd_users table';
+    END IF;
+END $$;
+
+-- =============================================================================
+-- 21. Indicator Community Tables
+-- =============================================================================
+
+-- Indicator Purchases (购买记录)
+CREATE TABLE IF NOT EXISTS qd_indicator_purchases (
+    id SERIAL PRIMARY KEY,
+    indicator_id INTEGER NOT NULL REFERENCES qd_indicator_codes(id) ON DELETE CASCADE,
+    buyer_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    seller_id INTEGER NOT NULL REFERENCES qd_users(id),
+    price DECIMAL(10,2) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE(indicator_id, buyer_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_purchases_indicator ON qd_indicator_purchases(indicator_id);
+CREATE INDEX IF NOT EXISTS idx_purchases_buyer ON qd_indicator_purchases(buyer_id);
+CREATE INDEX IF NOT EXISTS idx_purchases_seller ON qd_indicator_purchases(seller_id);
+
+-- Indicator Comments (评论)
+CREATE TABLE IF NOT EXISTS qd_indicator_comments (
+    id SERIAL PRIMARY KEY,
+    indicator_id INTEGER NOT NULL REFERENCES qd_indicator_codes(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    rating INTEGER DEFAULT 5 CHECK (rating >= 1 AND rating <= 5),
+    content TEXT DEFAULT '',
+    parent_id INTEGER REFERENCES qd_indicator_comments(id) ON DELETE CASCADE,
+    is_deleted INTEGER DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_comments_indicator ON qd_indicator_comments(indicator_id);
+CREATE INDEX IF NOT EXISTS idx_comments_user ON qd_indicator_comments(user_id);
+
+-- Add community stats columns to qd_indicator_codes
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_indicator_codes' AND column_name = 'purchase_count'
+    ) THEN
+        ALTER TABLE qd_indicator_codes ADD COLUMN purchase_count INTEGER DEFAULT 0;
+        RAISE NOTICE 'Added purchase_count column to qd_indicator_codes';
+    END IF;
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_indicator_codes' AND column_name = 'avg_rating'
+    ) THEN
+        ALTER TABLE qd_indicator_codes ADD COLUMN avg_rating DECIMAL(3,2) DEFAULT 0;
+        RAISE NOTICE 'Added avg_rating column to qd_indicator_codes';
+    END IF;
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_indicator_codes' AND column_name = 'rating_count'
+    ) THEN
+        ALTER TABLE qd_indicator_codes ADD COLUMN rating_count INTEGER DEFAULT 0;
+        RAISE NOTICE 'Added rating_count column to qd_indicator_codes';
+    END IF;
+    
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_indicator_codes' AND column_name = 'view_count'
+    ) THEN
+        ALTER TABLE qd_indicator_codes ADD COLUMN view_count INTEGER DEFAULT 0;
+        RAISE NOTICE 'Added view_count column to qd_indicator_codes';
+    END IF;
+END $$;
 
 -- =============================================================================
 -- Completion Notice

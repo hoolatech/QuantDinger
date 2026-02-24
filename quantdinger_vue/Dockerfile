@@ -6,8 +6,6 @@ WORKDIR /app
 
 # Copy package files
 COPY package*.json ./
-COPY pnpm-lock.yaml* ./
-COPY yarn.lock* ./
 
 # Install dependencies (prefer npm)
 RUN npm install --legacy-peer-deps
@@ -19,7 +17,8 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Production image (using nginx)
-FROM nginx:alpine
+# Use specific version to avoid mirror registry issues
+FROM nginx:1.25-alpine
 
 # Copy build artifacts
 COPY --from=builder /app/dist /usr/share/nginx/html

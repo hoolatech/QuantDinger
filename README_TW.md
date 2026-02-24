@@ -107,6 +107,14 @@ QuantDinger 包含一個內置的**基於 LLM 的多智能體研究系統**，�
 ## 📸 功能預覽
 
 <div align="center">
+  <h3>🗺️ 系統架構總覽</h3>
+  <p>QuantDinger AI 驅動的研究、回測和自動化交易功能全景圖。</p>
+  <img src="docs/screenshots/tuopu.png" alt="QuantDinger 系統拓撲圖" width="100%" style="border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-width: 800px;">
+</div>
+
+<br/>
+
+<div align="center">
   <h3>📊 專業量化儀表盤</h3>
   <p>實時監控市場動態、資產狀況和策略狀態。</p>
   <img src="docs/screenshots/dashboard.png" alt="QuantDinger Dashboard" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
@@ -172,14 +180,16 @@ QuantDinger 包含一個內置的**基於 LLM 的多智能體研究系統**，�
       - **外匯**：通過 MetaTrader 5 (MT5) 🆕
     - **信號通知**：針對不支持實盤交易的市場（A股/期貨），通過 Telegram, Discord, Email, SMS 或 Webhook 發送信號。
 
-### 3. AI 多智能體投研
-*你的 7x24 小時 AI 投委會。*
+### 3. AI 智能分析
+*快速、準確、專業的分析報告。*
 
-系統僱用了一個多智能體團隊作為你策略的二次過濾器：
+QuantDinger 具備精簡高效的 AI 分析系統：
 
-- **研究智能體**：抓取網絡新聞和宏觀事件（Google/Bing）。
-- **分析智能體**：分析技術指標和資金流向。
-- **策略集成**：AI 的判斷可以作為「市場過濾器」——僅當 AI 情緒一致時才允許策略交易（例如：「如果 AI 風險分析師標記宏觀風險極高，則不要買入」）。
+- **快速分析模式**：單次 LLM 調用架構，快速準確地生成分析（取代複雜的多智能體系統）
+- **全球市場集成**：實時市場數據、熱力圖和財經日曆集成到分析頁面
+- **基於 ATR 的交易建議**：止損和止盈建議基於技術分析（ATR、支撐/阻力位）
+- **分析記憶系統**：存儲分析結果用於歷史回顧和持續學習
+- **策略集成**：AI 分析可作為策略的「市場過濾器」
 
 ### 4. 通用數據引擎
 
@@ -296,11 +306,42 @@ score = w_{sim}\cdot sim + w_{recency}\cdot recency + w_{returns}\cdot returns\_
 - **自動恢復**：系統重啟後恢復運行中的策略
 - **訂單隊列**：後台工作線程用於訂單執行
 
-### 7. 技術棧
+### 7. 多LLM提供商支援
 
-- **後端**：Python (Flask) + SQLite + Redis（可選）
+QuantDinger 支援多個 AI 提供商，具備自動檢測功能：
+
+| 提供商 | 特點 |
+|--------|------|
+| **OpenRouter** | 多模型閘道（預設），100+ 模型 |
+| **OpenAI** | GPT-4o, GPT-4o-mini |
+| **Google Gemini** | Gemini 1.5 Flash/Pro |
+| **DeepSeek** | DeepSeek Chat（高性價比） |
+| **xAI Grok** | Grok Beta |
+
+只需在 `.env` 中配置您首選提供商的 API 金鑰，系統會自動檢測可用提供商。
+
+### 8. 指標社區
+*分享、發現、交易指標。*
+
+- **發佈與分享**：與社區分享你的 Python 指標
+- **購買系統**：從其他使用者購買優質付費指標
+- **評分與評論**：對購買的指標進行評分和評論
+- **管理員審核**：品質控制的審核系統
+
+### 9. 使用者管理與安全
+
+- **多使用者支援**：基於 PostgreSQL 的使用者帳戶，支援基於角色的權限管理
+- **OAuth 登入**：Google 和 GitHub OAuth 整合
+- **郵箱驗證**：透過郵箱驗證碼進行註冊和密碼重設
+- **安全功能**：Cloudflare Turnstile 人機驗證、IP/帳戶速率限制
+- **示範模式**：用於公開示範的唯讀模式
+
+### 10. 技術棧
+
+- **後端**：Python (Flask) + PostgreSQL + Redis（可選）
 - **前端**：Vue 2 + Ant Design Vue + KlineCharts/ECharts
 - **部署**：Docker Compose
+- **當前版本**：V2.1.1 ([更新日誌](docs/CHANGELOG.md))
 
 ---
 
@@ -321,6 +362,7 @@ QuantDinger 支持多種市場類型的執行方式：
 | KuCoin | 現貨, 合約 |
 | Gate.io | 現貨, 合約 |
 | Bitfinex | 現貨, 衍生品 |
+| Deepcoin | 現貨, 永續 |
 
 ### 傳統券商
 
@@ -504,10 +546,15 @@ npm run serve
 使用 `backend_api_python/env.example` 作為模板。常用設置包括：
 
 - **認證**: `SECRET_KEY`, `ADMIN_USER`, `ADMIN_PASSWORD`
-- **服務器**: `PYTHON_API_HOST`, `PYTHON_API_PORT`, `PYTHON_API_DEBUG`
-- **AI / LLM**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
-- **網絡搜索**: `SEARCH_PROVIDER`, `SEARCH_GOOGLE_*`, `SEARCH_BING_API_KEY`
+- **伺服器**: `PYTHON_API_HOST`, `PYTHON_API_PORT`, `PYTHON_API_DEBUG`
+- **資料庫**: `DATABASE_URL` (PostgreSQL 連接字串)
+- **AI / LLM**: `LLM_PROVIDER` (openrouter/openai/google/deepseek/grok), 各提供商 API 金鑰
+- **OAuth**: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
+- **安全**: `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `ENABLE_REGISTRATION`
+- **網路搜尋**: `SEARCH_PROVIDER`, `SEARCH_GOOGLE_*`, `SEARCH_BING_API_KEY`
+- **訂單執行**: `ORDER_MODE` (maker/market), `MAKER_WAIT_SEC`, `MAKER_OFFSET_BPS`
 - **代理 (可選)**: `PROXY_PORT` 或 `PROXY_URL`
+- **後台服務**: `ENABLE_PENDING_ORDER_WORKER`, `ENABLE_PORTFOLIO_MONITOR`
 
 ---
 
@@ -548,43 +595,6 @@ QuantDinger 的代碼使用 **Apache License 2.0** 授權。但請注意：**Apa
 
 ---
 
-### 💼 值得信賴的交易所合作夥伴（聯盟鏈接）
-
-使用我們的合作夥伴鏈接，在享受相同交易體驗的同時支持 QuantDinger 的發展。
-
-<div align="center">
-<table>
-  <tr>
-    <td align="center" width="33.33%">
-      <a href="https://www.bmwweb.ac/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_9OSOJ" target="_blank">
-        <img src="https://img.shields.io/badge/Binance-Exchange-F0B90B?style=for-the-badge&logo=binance&logoColor=white" alt="Binance" />
-      </a>
-      <br/><br/>
-      <strong>全球最大的加密貨幣交易所</strong><br/>
-      <small>現貨 • 期貨 • 槓桿交易</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://www.bjwebptyiou.com/join/14449926" target="_blank">
-        <img src="https://img.shields.io/badge/OKX-Exchange-000000?style=for-the-badge&logo=okx&logoColor=white" alt="OKX" />
-      </a>
-      <br/><br/>
-      <strong>領先的衍生品平台</strong><br/>
-      <small>現貨 • 永續合約 • 期權</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://share.glassgs.com/u/H8XZGS71" target="_blank">
-        <img src="https://img.shields.io/badge/Bitget-Exchange-1F2937?style=for-the-badge&logo=bitget&logoColor=white" alt="Bitget" />
-      </a>
-      <br/><br/>
-      <strong>創新的跟單交易</strong><br/>
-      <small>現貨 • 期貨 • 社交交易</small>
-    </td>
-  </tr>
-</table>
-</div>
-
----
-
 ### 💝 直接支持（捐贈）
 
 你的貢獻幫助我們維護和改進 QuantDinger。
@@ -599,6 +609,30 @@ QuantDinger 的代碼使用 **Apache License 2.0** 授權。但請注意：**Apa
   <img src="https://img.shields.io/badge/USDT-Accepted-26A17B?style=for-the-badge&logo=tether&logoColor=white" alt="USDT">
   <img src="https://img.shields.io/badge/ETH-Accepted-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white" alt="ETH">
 </p>
+
+---
+
+### 🎓 支持夥伴
+
+我們很榮幸獲得推動量化金融教育和研究的學術機構和組織的支持。
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://beinvolved.indiana.edu/organization/quantfiniu" target="_blank">
+        <img src="docs/screenshots/qfs_logo.png" alt="印第安納大學量化金融學會" width="280" style="border-radius: 8px;">
+      </a>
+      <br/><br/>
+      <strong>量化金融學會 (QFS)</strong><br/>
+      <small>印第安納大學布盧明頓分校</small><br/>
+      <small>培養下一代量化金融專業人才</small>
+    </td>
+  </tr>
+</table>
+</div>
+
+> 💡 **有興趣成為支持夥伴嗎？** 我們歡迎與大學、研究機構和組織合作。請透過 [brokermr810@gmail.com](mailto:brokermr810@gmail.com) 或 [Telegram](https://t.me/worldinbroker) 聯繫我們。
 
 ---
 

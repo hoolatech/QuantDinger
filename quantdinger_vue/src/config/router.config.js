@@ -30,6 +30,13 @@ export const asyncRouterMap = [
         component: () => import('@/views/indicator-analysis'),
         meta: { title: 'menu.dashboard.indicator', keepAlive: true, icon: 'line-chart', permission: ['dashboard'] }
       },
+      // 指标市场（放在指标分析下面）
+      {
+        path: '/indicator-community',
+        name: 'IndicatorCommunity',
+        component: () => import('@/views/indicator-community'),
+        meta: { title: 'menu.dashboard.community', keepAlive: false, icon: 'shop', permission: ['dashboard'] }
+      },
       // 交易助手
       {
         path: '/trading-assistant',
@@ -44,20 +51,6 @@ export const asyncRouterMap = [
         component: () => import('@/views/portfolio'),
         meta: { title: 'menu.dashboard.portfolio', keepAlive: true, icon: 'fund', permission: ['dashboard'] }
       },
-      // 指标社区（keepAlive disabled intentionally for iframe page)
-      {
-        path: '/indicator-community',
-        name: 'IndicatorCommunity',
-        component: () => import('@/views/indicator-community'),
-        meta: { title: 'menu.dashboard.community', keepAlive: false, icon: 'shop', permission: ['dashboard'] }
-      },
-      // 系统设置 (admin only)
-      {
-        path: '/settings',
-        name: 'Settings',
-        component: () => import('@/views/settings'),
-        meta: { title: 'menu.settings', keepAlive: false, icon: 'setting', permission: ['admin'] }
-      },
       // 用户管理 (admin only)
       {
         path: '/user-manage',
@@ -71,6 +64,13 @@ export const asyncRouterMap = [
         name: 'Profile',
         component: () => import('@/views/profile'),
         meta: { title: 'menu.myProfile', keepAlive: false, icon: 'user', permission: ['dashboard'] }
+      },
+      // 系统设置 (admin only) - 放在最后
+      {
+        path: '/settings',
+        name: 'Settings',
+        component: () => import('@/views/settings'),
+        meta: { title: 'menu.settings', keepAlive: false, icon: 'setting', permission: ['admin'] }
       }
 
       // other

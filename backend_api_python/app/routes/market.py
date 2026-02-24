@@ -66,7 +66,7 @@ def get_public_config():
                 'google/gemini-2.5-pro': 'Google: Gemini 2.5 Pro',
                 'openai/gpt-4o-mini': 'OpenAI: GPT-4o-mini',
                 'openai/gpt-5-mini': 'OpenAI: GPT-5 Mini',
-                'openai/gpt-oss-120b': 'OpenAI: gpt-oss-120b',
+                'openai/gpt-4.1-mini': 'OpenAI: GPT-4.1 Mini',
                 'deepseek/deepseek-v3.2': 'DeepSeek: DeepSeek V3.2',
                 'minimax/minimax-m2': 'MiniMax: MiniMax M2',
                 'anthropic/claude-sonnet-4': 'Anthropic: Claude Sonnet 4',
@@ -352,24 +352,40 @@ def get_watchlist_prices():
                 future = executor.submit(get_single_price, market, symbol)
                 futures[future] = (market, symbol)
         
-        # 收集结果（保持顺序）
-        for future in as_completed(futures, timeout=30):
-            try:
-                result = future.result()
-                results.append(result)
-            except Exception as e:
-                market, symbol = futures[future]
-                logger.error(f"Price fetch timed out or failed: {market}:{symbol} - {str(e)}")
-                results.append({
-                    'market': market,
-                    'symbol': symbol,
-                    'price': 0,
-                    'change': 0,
-                    'changePercent': 0
-                })
+        # 收集结果（带超时保护）
+        completed_futures = set()
+        try:
+            for future in as_completed(futures, timeout=30):
+                completed_futures.add(future)
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    market, symbol = futures[future]
+                    logger.warning(f"Price fetch failed: {market}:{symbol} - {str(e)}")
+                    results.append({
+                        'market': market,
+                        'symbol': symbol,
+                        'price': 0,
+                        'change': 0,
+                        'changePercent': 0
+                    })
+        except TimeoutError:
+            # 超时时，为未完成的任务添加默认结果
+            for future, (market, symbol) in futures.items():
+                if future not in completed_futures:
+                    logger.warning(f"Price fetch timed out: {market}:{symbol}")
+                    results.append({
+                        'market': market,
+                        'symbol': symbol,
+                        'price': 0,
+                        'change': 0,
+                        'changePercent': 0,
+                        'error': 'timeout'
+                    })
         
         success_count = sum(1 for r in results if r.get('price', 0) > 0)
-        # logger.info(f"批量获取完成，成功: {success_count}/{len(results)}")
+        logger.info(f"Watchlist prices: {success_count}/{len(results)} successful")
         
         return jsonify({
             'code': 1,

@@ -175,17 +175,27 @@ def login():
         if user.get('status') == 'pending':
             return jsonify({'code': 0, 'msg': 'Account is pending activation', 'data': None}), 403
         
-        # Step 4: Generate token
+        # Step 4: Increment token_version (invalidates old sessions for single-client login)
+        user_id = user.get('id') or user.get('user_id', 1)
+        try:
+            from app.services.user_service import get_user_service
+            new_token_version = get_user_service().increment_token_version(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to increment token_version: {e}")
+            new_token_version = 1
+        
+        # Step 5: Generate token with new token_version
         token = generate_token(
-            user_id=user.get('id') or user.get('user_id', 1),
+            user_id=user_id,
             username=user.get('username', username),
-            role=user.get('role', 'admin')
+            role=user.get('role', 'admin'),
+            token_version=new_token_version  # 包含新的 token_version
         )
         
         if not token:
             return jsonify({'code': 500, 'msg': 'Token generation error', 'data': None}), 500
         
-        # Step 5: Record successful login
+        # Step 6: Record successful login
         security.record_login_attempt(ip_address, 'ip', True, ip_address, user_agent)
         security.record_login_attempt(username, 'account', True, ip_address, user_agent)
         security.clear_login_attempts(ip_address, 'ip')
@@ -359,11 +369,19 @@ def login_with_code():
                                        {'reason': 'account_disabled'})
             return jsonify({'code': 0, 'msg': 'Account is disabled', 'data': None}), 403
         
-        # Generate token
+        # Increment token_version (invalidates old sessions for single-client login)
+        try:
+            new_token_version = user_service.increment_token_version(user['id'])
+        except Exception as e:
+            logger.warning(f"Failed to increment token_version: {e}")
+            new_token_version = 1
+        
+        # Generate token with new token_version
         token = generate_token(
             user_id=user['id'],
             username=user['username'],
-            role=user.get('role', 'user')
+            role=user.get('role', 'user'),
+            token_version=new_token_version
         )
         
         if not token:
@@ -379,9 +397,14 @@ def login_with_code():
                     (user['id'],)
                 )
                 db.commit()
+                affected = cur.rowcount
                 cur.close()
+                if affected == 0:
+                    logger.error(f"Failed to update last_login_at: no rows affected for user_id={user['id']}")
+                else:
+                    logger.info(f"Updated last_login_at for user_id={user['id']}")
         except Exception as e:
-            logger.warning(f"Failed to update last_login_at: {e}")
+            logger.error(f"Failed to update last_login_at for user_id={user.get('id')}: {e}")
         
         # Log login
         security.log_security_event('login_via_code', user['id'], ip_address, user_agent)
@@ -449,10 +472,25 @@ def send_verification_code():
         if not email or not email_service.is_valid_email(email):
             return jsonify({'code': 0, 'msg': 'Invalid email address', 'data': None}), 400
         
-        # Verify Turnstile
-        turnstile_ok, turnstile_msg = security.verify_turnstile(turnstile_token, ip_address)
-        if not turnstile_ok:
-            return jsonify({'code': 0, 'msg': turnstile_msg, 'data': None}), 400
+        # For change_password type with logged-in user, skip Turnstile verification
+        # because user already authenticated
+        skip_turnstile = False
+        if code_type == 'change_password':
+            # Try to get user_id from token (this route doesn't require login)
+            from app.utils.auth import verify_token
+            auth_header = request.headers.get('Authorization')
+            if auth_header:
+                parts = auth_header.split()
+                if len(parts) == 2 and parts[0].lower() == 'bearer':
+                    payload = verify_token(parts[1])
+                    if payload and payload.get('user_id'):
+                        skip_turnstile = True
+        
+        # Verify Turnstile (skip for authenticated change_password requests)
+        if not skip_turnstile:
+            turnstile_ok, turnstile_msg = security.verify_turnstile(turnstile_token, ip_address)
+            if not turnstile_ok:
+                return jsonify({'code': 0, 'msg': turnstile_msg, 'data': None}), 400
         
         # Check rate limit
         can_send, rate_msg = security.can_send_verification_code(email, ip_address)
@@ -627,8 +665,19 @@ def register():
         security.log_security_event('register', user_id, ip_address, user_agent, 
                                    {'email': email, 'referred_by': referred_by})
         
-        # Auto login after registration
-        token = generate_token(user_id=user_id, username=username, role='user')
+        # Auto login after registration (get token_version for new user)
+        try:
+            new_token_version = user_service.get_token_version(user_id)
+        except Exception as e:
+            logger.warning(f"Failed to get token_version: {e}")
+            new_token_version = 1
+        
+        token = generate_token(
+            user_id=user_id, 
+            username=username, 
+            role='user',
+            token_version=new_token_version
+        )
         
         is_demo = os.getenv('IS_DEMO_MODE', 'false').lower() == 'true'
         
@@ -853,11 +902,21 @@ def oauth_google_callback():
             error_msg = user_result.get('error', 'user_creation_failed')
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error_msg))
         
-        # Generate token
+        # Increment token_version (invalidates old sessions for single-client login)
+        from app.services.user_service import get_user_service
+        user_service = get_user_service()
+        try:
+            new_token_version = user_service.increment_token_version(user_result['id'])
+        except Exception as e:
+            logger.warning(f"Failed to increment token_version: {e}")
+            new_token_version = 1
+        
+        # Generate token with new token_version
         token = generate_token(
             user_id=user_result['id'],
             username=user_result['username'],
-            role=user_result.get('role', 'user')
+            role=user_result.get('role', 'user'),
+            token_version=new_token_version
         )
         
         # Log OAuth login
@@ -929,11 +988,21 @@ def oauth_github_callback():
             error_msg = user_result.get('error', 'user_creation_failed')
             return redirect(_build_frontend_login_redirect(frontend_url, oauth_error=error_msg))
         
-        # Generate token
+        # Increment token_version (invalidates old sessions for single-client login)
+        from app.services.user_service import get_user_service
+        user_service = get_user_service()
+        try:
+            new_token_version = user_service.increment_token_version(user_result['id'])
+        except Exception as e:
+            logger.warning(f"Failed to increment token_version: {e}")
+            new_token_version = 1
+        
+        # Generate token with new token_version
         token = generate_token(
             user_id=user_result['id'],
             username=user_result['username'],
-            role=user_result.get('role', 'user')
+            role=user_result.get('role', 'user'),
+            token_version=new_token_version
         )
         
         # Log OAuth login

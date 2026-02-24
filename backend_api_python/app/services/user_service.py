@@ -170,13 +170,84 @@ class UserService:
                     (user['id'],)
                 )
                 db.commit()
+                affected = cur.rowcount
                 cur.close()
+                if affected == 0:
+                    logger.error(f"Failed to update last_login_at: no rows affected for user_id={user['id']}")
+                else:
+                    logger.info(f"Updated last_login_at for user_id={user['id']}")
         except Exception as e:
-            logger.warning(f"Failed to update last_login_at: {e}")
+            logger.error(f"Failed to update last_login_at for user_id={user.get('id')}: {e}")
         
         # Remove password_hash from return value
         user.pop('password_hash', None)
         return user
+    
+    def get_token_version(self, user_id: int) -> int:
+        """
+        获取用户当前的 token 版本号。
+        
+        Args:
+            user_id: 用户ID
+        
+        Returns:
+            当前 token 版本号，默认为 1
+        """
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    "SELECT token_version FROM qd_users WHERE id = ?",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+                cur.close()
+                if row:
+                    return int(row.get('token_version') or 1)
+                return 1
+        except Exception as e:
+            logger.error(f"get_token_version failed: {e}")
+            return 1
+    
+    def increment_token_version(self, user_id: int) -> int:
+        """
+        递增用户的 token 版本号，使旧的 token 失效。
+        用于实现单一客户端登录（踢出其他设备）。
+        
+        Args:
+            user_id: 用户ID
+        
+        Returns:
+            新的 token 版本号
+        """
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                # 递增 token_version
+                cur.execute(
+                    """
+                    UPDATE qd_users 
+                    SET token_version = COALESCE(token_version, 0) + 1, updated_at = NOW()
+                    WHERE id = ?
+                    """,
+                    (user_id,)
+                )
+                db.commit()
+                
+                # 获取新的 token_version
+                cur.execute(
+                    "SELECT token_version FROM qd_users WHERE id = ?",
+                    (user_id,)
+                )
+                row = cur.fetchone()
+                cur.close()
+                
+                new_version = int(row.get('token_version') or 1) if row else 1
+                logger.info(f"Incremented token_version for user_id={user_id} to {new_version}")
+                return new_version
+        except Exception as e:
+            logger.error(f"increment_token_version failed: {e}")
+            return 1
     
     def create_user(self, data: Dict[str, Any] = None, **kwargs) -> Optional[int]:
         """

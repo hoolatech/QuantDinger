@@ -24,6 +24,7 @@ import numpy as np
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.auth import login_required
+from app.services.indicator_params import IndicatorCaller
 import requests
 
 logger = get_logger(__name__)
@@ -199,29 +200,76 @@ def save_indicator():
 
         now = _now_ts()  # For BIGINT fields (createtime, updatetime)
 
+        # 检查用户是否是管理员（管理员发布的指标自动通过审核）
+        user_role = getattr(g, 'user_role', 'user')
+        is_admin = user_role == 'admin'
+        
         with get_db_connection() as db:
             cur = db.cursor()
             if indicator_id and indicator_id > 0:
-                cur.execute(
-                    """
-                    UPDATE qd_indicator_codes
-                    SET name = ?, code = ?, description = ?,
-                        publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
-                        updatetime = ?, updated_at = NOW()
-                    WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
-                    """,
-                    (name, code, description, publish_to_community, pricing_type, price, preview_image, now, indicator_id, user_id),
-                )
+                # 检查是否从未发布改为发布，需要设置审核状态
+                if publish_to_community:
+                    cur.execute(
+                        "SELECT publish_to_community, review_status FROM qd_indicator_codes WHERE id = ? AND user_id = ?",
+                        (indicator_id, user_id)
+                    )
+                    existing = cur.fetchone()
+                    was_published = existing and existing.get('publish_to_community')
+                    # 如果之前未发布，现在发布，设置审核状态
+                    # 管理员发布的直接通过，普通用户需要待审核
+                    new_review_status = 'approved' if is_admin else 'pending'
+                    if not was_published:
+                        cur.execute(
+                            """
+                            UPDATE qd_indicator_codes
+                            SET name = ?, code = ?, description = ?,
+                                publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
+                                review_status = ?, review_note = '', reviewed_at = NOW(), reviewed_by = ?,
+                                updatetime = ?, updated_at = NOW()
+                            WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
+                            """,
+                            (name, code, description, publish_to_community, pricing_type, price, preview_image, 
+                             new_review_status, user_id if is_admin else None, now, indicator_id, user_id),
+                        )
+                    else:
+                        # 已发布过的更新，保持原审核状态
+                        cur.execute(
+                            """
+                            UPDATE qd_indicator_codes
+                            SET name = ?, code = ?, description = ?,
+                                publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
+                                updatetime = ?, updated_at = NOW()
+                            WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
+                            """,
+                            (name, code, description, publish_to_community, pricing_type, price, preview_image, now, indicator_id, user_id),
+                        )
+                else:
+                    # 取消发布，清除审核状态
+                    cur.execute(
+                        """
+                        UPDATE qd_indicator_codes
+                        SET name = ?, code = ?, description = ?,
+                            publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
+                            review_status = NULL, review_note = '', reviewed_at = NULL, reviewed_by = NULL,
+                            updatetime = ?, updated_at = NOW()
+                        WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
+                        """,
+                        (name, code, description, publish_to_community, pricing_type, price, preview_image, now, indicator_id, user_id),
+                    )
             else:
+                # 新建指标 - 管理员发布的直接通过，普通用户需要待审核
+                review_status = None
+                if publish_to_community:
+                    review_status = 'approved' if is_admin else 'pending'
                 cur.execute(
                     """
                     INSERT INTO qd_indicator_codes
                       (user_id, is_buy, end_time, name, code, description,
-                       publish_to_community, pricing_type, price, preview_image,
+                       publish_to_community, pricing_type, price, preview_image, review_status,
                        createtime, updatetime, created_at, updated_at)
-                    VALUES (?, 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                    VALUES (?, 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
                     """,
-                    (user_id, name, code, description, publish_to_community, pricing_type, price, preview_image, now, now),
+                    (user_id, name, code, description, publish_to_community, pricing_type, price, preview_image, review_status, now, now),
                 )
                 indicator_id = int(cur.lastrowid or 0)
             db.commit()
@@ -256,6 +304,48 @@ def delete_indicator():
         return jsonify({"code": 1, "msg": "success", "data": None})
     except Exception as e:
         logger.error(f"delete_indicator failed: {str(e)}", exc_info=True)
+        return jsonify({"code": 0, "msg": str(e), "data": None}), 500
+
+
+@indicator_bp.route("/getIndicatorParams", methods=["GET"])
+@login_required
+def get_indicator_params():
+    """
+    获取指标的参数声明
+    
+    用于前端在策略创建时显示可配置的参数表单。
+    
+    Query params:
+        indicator_id: 指标ID
+        
+    Returns:
+        params: [
+            {
+                "name": "ma_fast",
+                "type": "int",
+                "default": 5,
+                "description": "短期均线周期"
+            },
+            ...
+        ]
+    """
+    try:
+        from app.services.indicator_params import get_indicator_params as get_params
+        
+        indicator_id = request.args.get("indicator_id")
+        if not indicator_id:
+            return jsonify({"code": 0, "msg": "indicator_id is required", "data": None}), 400
+        
+        try:
+            indicator_id = int(indicator_id)
+        except ValueError:
+            return jsonify({"code": 0, "msg": "indicator_id must be an integer", "data": None}), 400
+        
+        params = get_params(indicator_id)
+        return jsonify({"code": 1, "msg": "success", "data": params})
+        
+    except Exception as e:
+        logger.error(f"get_indicator_params failed: {str(e)}", exc_info=True)
         return jsonify({"code": 0, "msg": str(e), "data": None}), 500
 
 
@@ -493,30 +583,24 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
             header = "# Existing code was provided as context.\n" + header
         return header + body
 
-    def _openrouter_base_and_key() -> tuple[str, str]:
-        """
-        Support both:
-          - OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-          - OPENROUTER_API_URL=https://openrouter.ai/api/v1/chat/completions
-        """
-        key = os.getenv("OPENROUTER_API_KEY", "").strip()
-        base = os.getenv("OPENROUTER_BASE_URL", "").strip()
-        if not base:
-            api_url = os.getenv("OPENROUTER_API_URL", "").strip()
-            if api_url.endswith("/chat/completions"):
-                base = api_url[: -len("/chat/completions")]
-        if not base:
-            base = "https://openrouter.ai/api/v1"
-        return base, key
-
-    def _generate_code_via_openrouter() -> str:
-        base_url, api_key = _openrouter_base_and_key()
-        if not api_key:
+    def _generate_code_via_llm() -> str:
+        """Use unified LLMService to support all configured providers (OpenRouter, OpenAI, Grok, etc.)."""
+        from app.services.llm import LLMService
+        
+        llm = LLMService()
+        
+        # Get provider and model from env config (no frontend override)
+        current_provider = llm.provider
+        current_model = llm.get_default_model()
+        current_api_key = llm.get_api_key()
+        base_url = llm.get_base_url()
+        
+        logger.info(f"AI Code Generation - Provider: {current_provider.value}, Model: {current_model}, Base URL: {base_url}, API Key configured: {bool(current_api_key)}")
+        
+        # Check if any LLM provider is configured
+        if not current_api_key:
+            logger.warning("No LLM API key configured, using template code")
             return _template_code()
-
-        model = os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini").strip() or "openai/gpt-4o-mini"
-        # Match legacy PHP default more closely
-        temperature = float(os.getenv("OPENROUTER_TEMPERATURE", "0.7") or 0.7)
 
         # Build user prompt (match PHP behavior)
         user_prompt = prompt
@@ -529,36 +613,36 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
                 + "\n\nPlease generate complete new Python code based on the existing code above and my modification requirements. Output the complete Python code directly, without explanations, without segmentation."
             )
 
-        payload = {
-            "model": model,
-            "temperature": temperature,
-            "stream": False,
-            "messages": [
+        temperature = float(os.getenv("OPENROUTER_TEMPERATURE", "0.7") or 0.7)
+        
+        # Call LLM using the unified API (auto-selects provider based on LLM_PROVIDER env)
+        # use_json_mode=False because we want raw Python code output
+        content = llm.call_llm_api(
+            messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-        }
-
-        resp = requests.post(
-            f"{base_url}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=120,
+            temperature=temperature,
+            use_json_mode=False  # Code generation doesn't need JSON mode
         )
-        resp.raise_for_status()
-        j = resp.json()
-        content = (((j.get("choices") or [{}])[0]).get("message") or {}).get("content") or ""
+        
+        # Clean up markdown code blocks if present
+        content = content.strip()
+        if content.startswith("```python"):
+            content = content[9:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        
         return content.strip() or _template_code()
 
     def stream():
         # 不扣任何 QDT：开源本地版直接生成/返回代码
         try:
-            code_text = _generate_code_via_openrouter()
+            code_text = _generate_code_via_llm()
         except Exception as e:
-            logger.warning(f"ai_generate openrouter failed, fallback to template: {e}")
+            logger.error(f"ai_generate LLM failed, fallback to template. Error: {type(e).__name__}: {e}")
             code_text = _template_code()
 
         # Stream in chunks (front-end appends).
@@ -576,3 +660,93 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@indicator_bp.route("/callIndicator", methods=["POST"])
+@login_required
+def call_indicator():
+    """
+    调用另一个指标（供前端 Pyodide 环境使用）
+    
+    POST /api/indicator/callIndicator
+    Body: {
+        "indicatorRef": int | str,  # 指标ID或名称
+        "klineData": List[Dict],      # K线数据
+        "params": Dict,              # 传递给被调用指标的参数（可选）
+        "currentIndicatorId": int     # 当前指标ID（用于循环依赖检测，可选）
+    }
+    
+    Returns:
+        {
+            "code": 1,
+            "data": {
+                "df": List[Dict],    # 执行后的DataFrame（转换为JSON）
+                "columns": List[str]  # DataFrame的列名
+            }
+        }
+    """
+    try:
+        data = request.get_json() or {}
+        indicator_ref = data.get("indicatorRef")
+        kline_data = data.get("klineData", [])
+        params = data.get("params") or {}
+        current_indicator_id = data.get("currentIndicatorId")
+        
+        if not indicator_ref:
+            return jsonify({
+                "code": 0,
+                "msg": "indicatorRef is required",
+                "data": None
+            }), 400
+        
+        if not kline_data or not isinstance(kline_data, list):
+            return jsonify({
+                "code": 0,
+                "msg": "klineData must be a non-empty list",
+                "data": None
+            }), 400
+        
+        # 获取用户ID
+        user_id = g.user_id
+        
+        # 创建 IndicatorCaller
+        indicator_caller = IndicatorCaller(user_id, current_indicator_id)
+        
+        # 将前端传入的K线数据转换为DataFrame
+        df = pd.DataFrame(kline_data)
+        
+        # 确保必要的列存在
+        required_columns = ['open', 'high', 'low', 'close', 'volume']
+        for col in required_columns:
+            if col not in df.columns:
+                df[col] = 0.0
+        
+        # 转换数据类型
+        df['open'] = df['open'].astype('float64')
+        df['high'] = df['high'].astype('float64')
+        df['low'] = df['low'].astype('float64')
+        df['close'] = df['close'].astype('float64')
+        df['volume'] = df['volume'].astype('float64')
+        
+        # 调用指标
+        result_df = indicator_caller.call_indicator(indicator_ref, df, params)
+        
+        # 将DataFrame转换为JSON格式（前端可以使用的格式）
+        result_dict = result_df.to_dict(orient='records')
+        
+        return jsonify({
+            "code": 1,
+            "msg": "success",
+            "data": {
+                "df": result_dict,
+                "columns": list(result_df.columns)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error calling indicator: {e}", exc_info=True)
+        return jsonify({
+            "code": 0,
+            "msg": str(e),
+            "data": None
+        }), 500

@@ -107,6 +107,14 @@ QuantDinger includes a built-in **LLM-based multi-agent research system** that g
 ## 📸 Visual Tour
 
 <div align="center">
+  <h3>🗺️ System Architecture Overview</h3>
+  <p>A comprehensive view of QuantDinger's AI-powered research, backtesting, and automated trading capabilities.</p>
+  <img src="docs/screenshots/tuopu.png" alt="QuantDinger System Topology" width="100%" style="border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-width: 800px;">
+</div>
+
+<br/>
+
+<div align="center">
   <h3>📊 Professional Quant Dashboard</h3>
   <p>Real-time monitoring of market dynamics, assets, and strategy status.</p>
   <img src="docs/screenshots/dashboard.png" alt="QuantDinger Dashboard" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
@@ -172,14 +180,16 @@ QuantDinger includes a built-in **LLM-based multi-agent research system** that g
       - **Forex**: Via MetaTrader 5 (MT5) 🆕
     - **Signal Notification**: For markets without live trading support (A-shares/Futures), send signals via Telegram, Discord, Email, SMS, or Webhook.
 
-### 3. AI Multi-Agent Research
-*Your 24/7 AI Investment Committee.*
+### 3. AI-Powered Analysis
+*Fast, Accurate, Professional Reports.*
 
-The system employs a multi-agent team to act as a secondary filter for your strategies:
+QuantDinger features a streamlined AI analysis system:
 
-- **Research Agents**: Scrape web news and macro events (Google/Bing).
-- **Analysis Agents**: Analyze technical indicators and capital flows.
-- **Strategic Integration**: The AI judgment can serve as a "Market Filter"—only allowing your strategy to trade when the AI sentiment aligns (e.g., "Don't buy if AI Risk Analyst flags high macro danger").
+- **Fast Analysis Mode**: Single LLM call architecture for quick, accurate analysis (replaces complex multi-agent system)
+- **Global Market Integration**: Real-time market data, heatmaps, and economic calendar integrated into the analysis page
+- **ATR-Based Trading Levels**: Stop-loss and take-profit recommendations based on technical analysis (ATR, Support/Resistance)
+- **Analysis Memory**: Store analysis results for history review and continuous learning
+- **Strategic Integration**: AI analysis can serve as a "Market Filter" for your strategies
 
 ### 4. Universal Data Engine
 
@@ -288,11 +298,42 @@ Config lives in `.env` (see `backend_api_python/env.example`): `ENABLE_AGENT_MEM
 - **Auto-Restore**: Resumes running strategies after system restarts
 - **Order Queue**: Background worker for order execution
 
-### 7. Tech Stack
+### 7. Multi-LLM Provider Support
+
+QuantDinger supports multiple AI providers with auto-detection:
+
+| Provider | Features |
+|----------|----------|
+| **OpenRouter** | Multi-model gateway (default), 100+ models |
+| **OpenAI** | GPT-4o, GPT-4o-mini |
+| **Google Gemini** | Gemini 1.5 Flash/Pro |
+| **DeepSeek** | DeepSeek Chat (cost-effective) |
+| **xAI Grok** | Grok Beta |
+
+Simply configure your preferred provider's API key in `.env`. The system auto-detects available providers.
+
+### 8. Indicator Community
+*Share, Discover, and Trade Indicators.*
+
+- **Publish & Share**: Share your Python indicators with the community
+- **Purchase System**: Buy premium indicators from other users
+- **Rating & Reviews**: Rate and review purchased indicators
+- **Admin Review**: Moderation system for quality control
+
+### 9. User Management & Security
+
+- **Multi-User Support**: PostgreSQL-backed user accounts with role-based permissions
+- **OAuth Login**: Google and GitHub OAuth integration
+- **Email Verification**: Registration and password reset via email codes
+- **Security Features**: Cloudflare Turnstile captcha, IP/account rate limiting
+- **Demo Mode**: Read-only mode for public demonstrations
+
+### 10. Tech Stack
 
 - **Backend**: Python (Flask) + PostgreSQL + Redis (optional)
 - **Frontend**: Vue 2 + Ant Design Vue + KlineCharts/ECharts
 - **Deployment**: Docker Compose (with PostgreSQL)
+- **Current Version**: V2.1.1 ([Changelog](docs/CHANGELOG.md))
 
 ---
 
@@ -708,10 +749,13 @@ Use `backend_api_python/env.example` as a template. Common settings include:
 - **Auth**: `SECRET_KEY`, `ADMIN_USER`, `ADMIN_PASSWORD`
 - **Server**: `PYTHON_API_HOST`, `PYTHON_API_PORT`, `PYTHON_API_DEBUG`
 - **Database**: `DATABASE_URL` (PostgreSQL connection string)
-- **AI / LLM**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`, timeouts
+- **AI / LLM**: `LLM_PROVIDER` (openrouter/openai/google/deepseek/grok), provider-specific API keys
+- **OAuth**: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
+- **Security**: `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `ENABLE_REGISTRATION`
 - **Web search**: `SEARCH_PROVIDER`, `SEARCH_GOOGLE_*`, `SEARCH_BING_API_KEY`
+- **Order Execution**: `ORDER_MODE` (maker/market), `MAKER_WAIT_SEC`, `MAKER_OFFSET_BPS`
 - **Proxy (optional)**: `PROXY_PORT` or `PROXY_URL`
-- **Workers**: `ENABLE_PENDING_ORDER_WORKER`, `DISABLE_RESTORE_RUNNING_STRATEGIES`
+- **Workers**: `ENABLE_PENDING_ORDER_WORKER`, `ENABLE_PORTFOLIO_MONITOR`
 
 ---
 
@@ -769,42 +813,6 @@ See: `TRADEMARKS.md`
 
 ---
 
-### 💼 Trusted Exchange Partners (Affiliate Links)
-
-By using our partner links, you support QuantDinger's development while enjoying the same trading experience.
-
-<div align="center">
-<table>
-  <tr>
-    <td align="center" width="33.33%">
-      <a href="https://www.bmwweb.ac/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_9OSOJ" target="_blank">
-        <img src="https://img.shields.io/badge/Binance-Exchange-F0B90B?style=for-the-badge&logo=binance&logoColor=white" alt="Binance" />
-      </a>
-      <br/><br/>
-      <strong>World's Largest Crypto Exchange</strong><br/>
-      <small>Spot • Futures • Margin Trading</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://www.bjwebptyiou.com/join/14449926" target="_blank">
-        <img src="https://img.shields.io/badge/OKX-Exchange-000000?style=for-the-badge&logo=okx&logoColor=white" alt="OKX" />
-      </a>
-      <br/><br/>
-      <strong>Leading Derivatives Platform</strong><br/>
-      <small>Spot • Perpetual • Options</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://share.glassgs.com/u/H8XZGS71" target="_blank">
-        <img src="https://img.shields.io/badge/Bitget-Exchange-1F2937?style=for-the-badge&logo=bitget&logoColor=white" alt="Bitget" />
-      </a>
-      <br/><br/>
-      <strong>Innovative Copy Trading</strong><br/>
-      <small>Spot • Futures • Social Trading</small>
-    </td>
-  </tr>
-</table>
-</div>
-
----
 
 ### 💝 Direct Support (Donations)
 
@@ -820,6 +828,30 @@ Your contributions help us maintain and improve QuantDinger.
   <img src="https://img.shields.io/badge/USDT-Accepted-26A17B?style=for-the-badge&logo=tether&logoColor=white" alt="USDT">
   <img src="https://img.shields.io/badge/ETH-Accepted-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white" alt="ETH">
 </p>
+
+---
+
+### 🎓 Supporting Partners
+
+We are proud to be supported by academic institutions and organizations advancing quantitative finance education and research.
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://beinvolved.indiana.edu/organization/quantfiniu" target="_blank">
+        <img src="docs/screenshots/qfs_logo.png" alt="Indiana University Quantitative Finance Society" width="280" style="border-radius: 8px;">
+      </a>
+      <br/><br/>
+      <strong>Quantitative Finance Society (QFS)</strong><br/>
+      <small>Indiana University Bloomington</small><br/>
+      <small>Fostering the next generation of quantitative finance professionals</small>
+    </td>
+  </tr>
+</table>
+</div>
+
+> 💡 **Interested in becoming a supporting partner?** We welcome collaborations with universities, research institutions, and organizations. Contact us at [brokermr810@gmail.com](mailto:brokermr810@gmail.com) or via [Telegram](https://t.me/worldinbroker).
 
 ---
 

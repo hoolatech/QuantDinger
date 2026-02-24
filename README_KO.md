@@ -107,6 +107,14 @@ QuantDinger는 웹에서 금융 정보를 수집하고, 로컬 시장 데이터�
 ## 📸 비주얼 투어
 
 <div align="center">
+  <h3>🗺️ 시스템 아키텍처 개요</h3>
+  <p>QuantDinger의 AI 기반 리서치, 백테스팅 및 자동화 거래 기능 전체 개요.</p>
+  <img src="docs/screenshots/tuopu.png" alt="QuantDinger 시스템 토폴로지" width="100%" style="border-radius: 10px; box-shadow: 0 4px 12px rgba(0,0,0,0.15); max-width: 800px;">
+</div>
+
+<br/>
+
+<div align="center">
   <h3>📊 전문 퀀트 대시보드</h3>
   <p>시장 역학, 자산 및 전략 상태에 대한 실시간 모니터링.</p>
   <img src="docs/screenshots/dashboard.png" alt="QuantDinger Dashboard" width="100%" style="border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.1);">
@@ -172,14 +180,16 @@ QuantDinger는 웹에서 금융 정보를 수집하고, 로컬 시장 데이터�
       - **외환**: MetaTrader 5 (MT5) 경유 🆕
     - **신호 알림**: 실거래를 지원하지 않는 시장(A주/선물)의 경우, Telegram, Discord, Email, SMS 또는 Webhook을 통해 신호를 전송하세요.
 
-### 3. AI 멀티 에이전트 리서치
-*연중무휴 24시간 AI 투자 위원회.*
+### 3. AI 분석 시스템
+*빠르고, 정확하며, 전문적인 리포트.*
 
-시스템은 전략의 2차 필터 역할을 하는 멀티 에이전트 팀을 고용합니다:
+QuantDinger는 효율적인 AI 분석 시스템을 탑재:
 
-- **리서치 에이전트**: 웹 뉴스 및 거시적 이벤트(Google/Bing)를 수집합니다.
-- **분석 에이전트**: 기술적 지표 및 자금 흐름을 분석합니다.
-- **전략 통합**: AI의 판단을 "시장 필터"로 사용할 수 있습니다. AI의 심리가 일치할 때만 전략 거래를 허용합니다(예: "AI 리스크 분석가가 거시적 리스크가 높다고 판단하면 매수하지 않음").
+- **빠른 분석 모드**: 단일 LLM 호출 아키텍처로 빠르고 정확한 분석 (복잡한 멀티 에이전트 시스템 대체)
+- **글로벌 시장 통합**: 실시간 시장 데이터, 히트맵, 경제 캘린더를 분석 페이지에 통합
+- **ATR 기반 거래 수준**: 기술적 분석(ATR, 지지/저항선)에 기반한 손절매 및 이익실현 권장
+- **분석 메모리**: 이력 검토 및 지속적 학습을 위한 분석 결과 저장
+- **전략 통합**: AI 분석을 전략의 "시장 필터"로 사용 가능
 
 ### 4. 범용 데이터 엔진
 
@@ -296,11 +306,42 @@ score = w_{sim}\cdot sim + w_{recency}\cdot recency + w_{returns}\cdot returns\_
 - **자동 복구**: 시스템 재시작 후 실행 중인 전략 재개
 - **주문 대기열**: 주문 실행을 위한 백그라운드 워커
 
-### 7. 기술 스택
+### 7. 멀티 LLM 제공자 지원
 
-- **백엔드**: Python (Flask) + SQLite + Redis（옵션）
+QuantDinger는 자동 감지 기능을 갖춘 여러 AI 제공자를 지원합니다:
+
+| 제공자 | 특징 |
+|--------|------|
+| **OpenRouter** | 멀티모델 게이트웨이(기본값), 100+ 모델 |
+| **OpenAI** | GPT-4o, GPT-4o-mini |
+| **Google Gemini** | Gemini 1.5 Flash/Pro |
+| **DeepSeek** | DeepSeek Chat(가성비 좋음) |
+| **xAI Grok** | Grok Beta |
+
+`.env`에서 선호하는 제공자의 API 키만 설정하면 시스템이 사용 가능한 제공자를 자동 감지합니다.
+
+### 8. 인디케이터 커뮤니티
+*공유, 발견, 거래.*
+
+- **게시 및 공유**: 파이썬 인디케이터를 커뮤니티와 공유
+- **구매 시스템**: 다른 사용자로부터 프리미엄 인디케이터 구매
+- **평점 및 리뷰**: 구매한 인디케이터 평가 및 리뷰
+- **관리자 검토**: 품질 관리를 위한 모더레이션 시스템
+
+### 9. 사용자 관리 및 보안
+
+- **멀티유저 지원**: PostgreSQL 기반 사용자 계정, 역할 기반 권한 관리
+- **OAuth 로그인**: Google 및 GitHub OAuth 통합
+- **이메일 인증**: 이메일 인증 코드를 통한 등록 및 비밀번호 재설정
+- **보안 기능**: Cloudflare Turnstile 캡차, IP/계정 속도 제한
+- **데모 모드**: 공개 데모를 위한 읽기 전용 모드
+
+### 10. 기술 스택
+
+- **백엔드**: Python (Flask) + PostgreSQL + Redis（옵션）
 - **프론트엔드**: Vue 2 + Ant Design Vue + KlineCharts/ECharts
 - **배포**: Docker Compose
+- **현재 버전**: V2.1.1 ([변경 로그](docs/CHANGELOG.md))
 
 ---
 
@@ -321,6 +362,7 @@ QuantDinger는 다양한 시장 유형에 대해 여러 실행 방법을 지원�
 | KuCoin | 현물, 선물 |
 | Gate.io | 현물, 선물 |
 | Bitfinex | 현물, 파생상품 |
+| Deepcoin | 현물, 무기한 |
 
 ### 전통적인 브로커
 
@@ -504,9 +546,14 @@ npm run serve
 
 - **인증**: `SECRET_KEY`, `ADMIN_USER`, `ADMIN_PASSWORD`
 - **서버**: `PYTHON_API_HOST`, `PYTHON_API_PORT`, `PYTHON_API_DEBUG`
-- **AI / LLM**: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
+- **데이터베이스**: `DATABASE_URL` (PostgreSQL 연결 문자열)
+- **AI / LLM**: `LLM_PROVIDER` (openrouter/openai/google/deepseek/grok), 각 제공자 API 키
+- **OAuth**: `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`
+- **보안**: `TURNSTILE_SITE_KEY`, `TURNSTILE_SECRET_KEY`, `ENABLE_REGISTRATION`
 - **웹 검색**: `SEARCH_PROVIDER`, `SEARCH_GOOGLE_*`, `SEARCH_BING_API_KEY`
+- **주문 실행**: `ORDER_MODE` (maker/market), `MAKER_WAIT_SEC`, `MAKER_OFFSET_BPS`
 - **프록시 (옵션)**: `PROXY_PORT` 또는 `PROXY_URL`
+- **백그라운드 서비스**: `ENABLE_PENDING_ORDER_WORKER`, `ENABLE_PORTFOLIO_MONITOR`
 
 ---
 
@@ -547,43 +594,6 @@ QuantDinger의 코드는 **Apache License 2.0**으로 제공됩니다. 다만 **
 
 ---
 
-### 💼 거래소 파트너(어필리에이트 링크)
-
-파트너 링크를 사용하면 동일한 거래 경험을 즐기면서 QuantDinger의 개발을 지원할 수 있습니다.
-
-<div align="center">
-<table>
-  <tr>
-    <td align="center" width="33.33%">
-      <a href="https://www.bmwweb.ac/referral/earn-together/refer2earn-usdc/claim?hl=zh-CN&ref=GRO_28502_9OSOJ" target="_blank">
-        <img src="https://img.shields.io/badge/Binance-Exchange-F0B90B?style=for-the-badge&logo=binance&logoColor=white" alt="Binance" />
-      </a>
-      <br/><br/>
-      <strong>세계 최대 암호화폐 거래소</strong><br/>
-      <small>현물 • 선물 • 마진 거래</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://www.bjwebptyiou.com/join/14449926" target="_blank">
-        <img src="https://img.shields.io/badge/OKX-Exchange-000000?style=for-the-badge&logo=okx&logoColor=white" alt="OKX" />
-      </a>
-      <br/><br/>
-      <strong>주요 파생상품 플랫폼</strong><br/>
-      <small>현물 • 영구 선물 • 옵션</small>
-    </td>
-    <td align="center" width="33.33%">
-      <a href="https://share.glassgs.com/u/H8XZGS71" target="_blank">
-        <img src="https://img.shields.io/badge/Bitget-Exchange-1F2937?style=for-the-badge&logo=bitget&logoColor=white" alt="Bitget" />
-      </a>
-      <br/><br/>
-      <strong>혁신적인 복사 거래</strong><br/>
-      <small>현물 • 선물 • 소셜 거래</small>
-    </td>
-  </tr>
-</table>
-</div>
-
----
-
 ### 💝 직접 지원(기부)
 
 귀하의 기여는 QuantDinger의 유지 및 개선에 도움이 됩니다.
@@ -598,6 +608,30 @@ QuantDinger의 코드는 **Apache License 2.0**으로 제공됩니다. 다만 **
   <img src="https://img.shields.io/badge/USDT-Accepted-26A17B?style=for-the-badge&logo=tether&logoColor=white" alt="USDT">
   <img src="https://img.shields.io/badge/ETH-Accepted-3C3C3D?style=for-the-badge&logo=ethereum&logoColor=white" alt="ETH">
 </p>
+
+---
+
+### 🎓 지원 파트너
+
+양적 금융 교육 및 연구를 발전시키는 학술 기관과 조직의 지원을 받게 되어 자랑스럽습니다.
+
+<div align="center">
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <a href="https://beinvolved.indiana.edu/organization/quantfiniu" target="_blank">
+        <img src="docs/screenshots/qfs_logo.png" alt="인디애나 대학교 양적금융학회" width="280" style="border-radius: 8px;">
+      </a>
+      <br/><br/>
+      <strong>양적금융학회 (QFS)</strong><br/>
+      <small>인디애나 대학교 블루밍턴</small><br/>
+      <small>차세대 양적 금융 전문가 양성</small>
+    </td>
+  </tr>
+</table>
+</div>
+
+> 💡 **지원 파트너가 되는 데 관심이 있으신가요?** 대학, 연구 기관 및 조직과의 협력을 환영합니다. [brokermr810@gmail.com](mailto:brokermr810@gmail.com) 또는 [Telegram](https://t.me/worldinbroker)으로 연락주세요.
 
 ---
 

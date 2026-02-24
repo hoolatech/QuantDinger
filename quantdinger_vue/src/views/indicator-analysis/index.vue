@@ -202,6 +202,14 @@
                                 @click.stop="handleOpenBacktestHistory(indicator)"
                               />
                             </a-tooltip>
+                            <!-- 发布到社区 -->
+                            <a-tooltip :title="indicator.publish_to_community ? $t('dashboard.indicator.action.unpublish') : $t('dashboard.indicator.action.publish')">
+                              <a-icon
+                                :type="indicator.publish_to_community ? 'cloud' : 'cloud-upload'"
+                                :class="['action-icon', 'publish-icon', { published: indicator.publish_to_community }]"
+                                @click.stop="handlePublishIndicator(indicator)"
+                              />
+                            </a-tooltip>
                           </div>
                         </div>
                         <span class="card-desc">{{ indicator.description || '' }}</span>
@@ -215,9 +223,66 @@
                   </div>
                 </div>
 
+                <!-- 我购买的指标 -->
+                <div class="indicator-section" :class="{ 'section-empty': purchasedIndicators.length === 0 }">
+                  <div class="section-label">
+                    <div class="section-label-left" @click="purchasedSectionCollapsed = !purchasedSectionCollapsed">
+                      <a-icon :type="purchasedSectionCollapsed ? 'right' : 'down'" class="collapse-icon" />
+                      <span>{{ $t('dashboard.indicator.section.purchased') }} ({{ purchasedIndicators.length }})</span>
+                    </div>
+                  </div>
+                  <div v-show="!purchasedSectionCollapsed" class="section-content custom-scrollbar">
+                    <div
+                      v-for="indicator in purchasedIndicators"
+                      :key="'purchased-' + indicator.id"
+                      :class="['indicator-card', 'purchased-indicator', { 'indicator-active': isIndicatorActive('purchased-' + indicator.id) }]"
+                      @click="toggleIndicator(indicator, 'purchased')"
+                    >
+                      <div class="card-content">
+                        <div class="card-header">
+                          <span class="card-name">
+                            <a-icon type="shopping" class="purchased-icon" />
+                            {{ indicator.name }}
+                          </span>
+                          <div class="card-actions">
+                            <!-- 购买的指标：只能启动/停止和回测，不能编辑删除 -->
+                            <a-tooltip :title="isIndicatorActive('purchased-' + indicator.id) ? $t('dashboard.indicator.action.stop') : $t('dashboard.indicator.action.start')">
+                              <a-icon
+                                :type="isIndicatorActive('purchased-' + indicator.id) ? 'pause-circle' : 'play-circle'"
+                                :class="['action-icon', 'toggle-icon', { active: isIndicatorActive('purchased-' + indicator.id) }]"
+                                @click.stop="toggleIndicator(indicator, 'purchased')"
+                              />
+                            </a-tooltip>
+                            <a-tooltip :title="$t('dashboard.indicator.backtest.title')">
+                              <a-icon
+                                type="experiment"
+                                class="action-icon backtest-icon"
+                                @click.stop="handleOpenBacktest(indicator)"
+                              />
+                            </a-tooltip>
+                            <a-tooltip :title="$t('dashboard.indicator.backtest.historyTitle')">
+                              <a-icon
+                                type="clock-circle"
+                                class="action-icon backtest-history-icon"
+                                @click.stop="handleOpenBacktestHistory(indicator)"
+                              />
+                            </a-tooltip>
+                          </div>
+                        </div>
+                        <span class="card-desc">{{ indicator.description || '' }}</span>
+                      </div>
+                    </div>
+                    <!-- 空状态 -->
+                    <div v-if="purchasedIndicators.length === 0" class="empty-indicators">
+                      <a-icon type="shopping" />
+                      <span>{{ $t('dashboard.indicator.emptyPurchased') }}</span>
+                    </div>
+                  </div>
+                </div>
+
               </template>
 
-              <!-- 手机端：仅显示“我创建的指标” -->
+              <!-- 手机端：显示指标列表 -->
               <template v-else>
                 <div class="mobile-tab-content">
                   <div class="section-content custom-scrollbar">
@@ -271,6 +336,14 @@
                                 @click.stop="handleOpenBacktestHistory(indicator)"
                               />
                             </a-tooltip>
+                            <!-- 发布到社区 -->
+                            <a-tooltip :title="indicator.publish_to_community ? $t('dashboard.indicator.action.unpublish') : $t('dashboard.indicator.action.publish')">
+                              <a-icon
+                                :type="indicator.publish_to_community ? 'cloud' : 'cloud-upload'"
+                                :class="['action-icon', 'publish-icon', { published: indicator.publish_to_community }]"
+                                @click.stop="handlePublishIndicator(indicator)"
+                              />
+                            </a-tooltip>
                           </div>
                         </div>
                         <span class="card-desc">{{ indicator.description || '' }}</span>
@@ -312,6 +385,61 @@
         @cancel="showBacktestModal = false; backtestIndicator = null"
       />
 
+      <!-- 指标参数配置弹窗 -->
+      <a-modal
+        :visible="showParamsModal"
+        :title="$t('dashboard.indicator.paramsConfig.title')"
+        :confirmLoading="loadingParams"
+        @ok="confirmIndicatorParams"
+        @cancel="cancelIndicatorParams"
+        @afterClose="handleParamsModalAfterClose"
+        :width="500"
+        :maskClosable="false"
+        :keyboard="false"
+      >
+        <div v-if="pendingIndicator" class="params-config-modal">
+          <div class="indicator-info">
+            <span class="indicator-name">{{ pendingIndicator.name }}</span>
+          </div>
+          <a-divider />
+          <div v-if="indicatorParams.length > 0" class="params-form">
+            <div v-for="param in indicatorParams" :key="param.name" class="param-item">
+              <div class="param-header">
+                <label class="param-label">{{ param.name }}</label>
+                <a-tooltip v-if="param.description" :title="param.description">
+                  <a-icon type="question-circle" style="color: #999; margin-left: 4px;" />
+                </a-tooltip>
+              </div>
+              <!-- 整数类型 -->
+              <a-input-number
+                v-if="param.type === 'int'"
+                v-model="indicatorParamValues[param.name]"
+                :precision="0"
+                style="width: 100%;"
+              />
+              <!-- 浮点数类型 -->
+              <a-input-number
+                v-else-if="param.type === 'float'"
+                v-model="indicatorParamValues[param.name]"
+                :precision="4"
+                style="width: 100%;"
+              />
+              <!-- 布尔类型 -->
+              <a-switch
+                v-else-if="param.type === 'bool'"
+                v-model="indicatorParamValues[param.name]"
+              />
+              <!-- 字符串类型 -->
+              <a-input
+                v-else
+                v-model="indicatorParamValues[param.name]"
+              />
+            </div>
+          </div>
+          <a-empty v-else :description="$t('dashboard.indicator.paramsConfig.noParams')" />
+        </div>
+      </a-modal>
+
       <!-- 回测记录抽屉 -->
       <backtest-history-drawer
         :visible="showBacktestHistoryDrawer"
@@ -331,6 +459,61 @@
         :run="selectedBacktestRun"
         @cancel="showBacktestRunViewer = false; selectedBacktestRun = null"
       />
+
+      <!-- 发布到社区弹窗 -->
+      <a-modal
+        :title="publishIndicator && publishIndicator.publish_to_community ? $t('dashboard.indicator.publish.editTitle') : $t('dashboard.indicator.publish.title')"
+        :visible="showPublishModal"
+        @ok="handleConfirmPublish"
+        @cancel="showPublishModal = false; publishIndicator = null"
+        :confirmLoading="publishing"
+        width="500px"
+        :okText="publishIndicator && publishIndicator.publish_to_community ? $t('dashboard.indicator.publish.update') : $t('dashboard.indicator.publish.confirm')"
+        :cancelText="$t('common.cancel')"
+      >
+        <a-form-model ref="publishForm" :model="publishForm" :rules="publishRules" layout="vertical">
+          <a-alert
+            type="info"
+            show-icon
+            :message="$t('dashboard.indicator.publish.hint')"
+            style="margin-bottom: 16px;"
+          />
+          <a-form-model-item :label="$t('dashboard.indicator.publish.pricingType')" prop="pricingType">
+            <a-radio-group v-model="publishPricingType">
+              <a-radio value="free">{{ $t('dashboard.indicator.publish.free') }}</a-radio>
+              <a-radio value="paid">{{ $t('dashboard.indicator.publish.paid') }}</a-radio>
+            </a-radio-group>
+          </a-form-model-item>
+          <a-form-model-item
+            v-if="publishPricingType === 'paid'"
+            :label="$t('dashboard.indicator.publish.price')"
+            prop="price"
+          >
+            <a-input-number
+              v-model="publishPrice"
+              :min="1"
+              :max="10000"
+              :precision="0"
+              style="width: 200px;"
+            />
+            <span style="margin-left: 8px;">{{ $t('community.credits') }}</span>
+          </a-form-model-item>
+          <a-form-model-item :label="$t('dashboard.indicator.publish.description')" prop="description">
+            <a-textarea
+              v-model="publishDescription"
+              :placeholder="$t('dashboard.indicator.publish.descriptionPlaceholder')"
+              :rows="4"
+              :maxLength="500"
+            />
+          </a-form-model-item>
+          <div v-if="publishIndicator && publishIndicator.publish_to_community" style="margin-top: 16px;">
+            <a-button type="danger" ghost @click="handleUnpublish" :loading="unpublishing">
+              <a-icon type="close-circle" />
+              {{ $t('dashboard.indicator.publish.unpublish') }}
+            </a-button>
+          </div>
+        </a-form-model>
+      </a-modal>
 
       <!-- 添加股票弹窗 -->
       <a-modal
@@ -552,12 +735,24 @@ export default {
       { id: 'ema30', name: 'EMA30 (30日指数均线)', shortName: 'EMA30', type: 'line', defaultParams: { length: 30 } }
     ]
 
-    // 从数据库获取的指标（仅保留“我创建的指标”）
+    // 从数据库获取的指标
     const customIndicators = ref([]) // 我创建的指标（is_buy=0）
+    const purchasedIndicators = ref([]) // 我购买的指标（is_buy=1）
     const loadingIndicators = ref(false)
+
+    // 指标参数配置弹窗
+    const showParamsModal = ref(false)
+    const pendingIndicator = ref(null) // 待运行的指标
+    const pendingSource = ref('') // 待运行指标的来源 (custom/purchased)
+    const indicatorParams = ref([]) // 指标参数声明
+    const indicatorParamValues = ref({}) // 用户设置的参数值
+    const loadingParams = ref(false)
+    // 保存每个指标的参数值（key: indicatorId, value: { paramName: paramValue }）
+    const savedIndicatorParams = ref({})
 
     // 折叠状态
     const customSectionCollapsed = ref(false) // 我创建的指标区域是否折叠
+    const purchasedSectionCollapsed = ref(false) // 我购买的指标区域是否折叠
 
     // 指标编辑器相关
     const showIndicatorEditor = ref(false)
@@ -572,6 +767,21 @@ export default {
     const backtestHistoryIndicator = ref(null)
     const showBacktestRunViewer = ref(false)
     const selectedBacktestRun = ref(null)
+
+    // 发布到社区相关
+    const showPublishModal = ref(false)
+    const publishIndicator = ref(null)
+    const publishing = ref(false)
+    const unpublishing = ref(false)
+    // 使用独立的 ref 变量，确保 v-model 正常工作
+    const publishPricingType = ref('free')
+    const publishPrice = ref(10)
+    const publishDescription = ref('')
+    const publishRules = {
+      price: [
+        { required: true, message: '请输入价格', trigger: 'blur', type: 'number' }
+      ]
+    }
 
     // 实时更新设置
     const realtimeEnabled = ref(false) // 是否启用实时更新
@@ -1090,13 +1300,21 @@ export default {
         })
 
         if (res.code === 1 && res.data) {
-          // 仅保留我创建的指标（过滤掉 is_buy=1）
-          const customItems = res.data.filter(item => item.is_buy === 0 || item.is_buy === '0' || item.is_buy === undefined || item.is_buy === null)
+          // 我创建的指标（is_buy=0 或未设置）
+          const customItems = res.data.filter(item => !item.is_buy || item.is_buy === 0 || item.is_buy === '0')
+          // 我购买的指标（is_buy=1）
+          const purchasedItems = res.data.filter(item => item.is_buy === 1 || item.is_buy === '1')
 
           customIndicators.value = customItems.map(item => ({
             ...item,
-            type: 'python', // 标识为Python代码指标
+            type: 'python',
             source: 'custom'
+          }))
+
+          purchasedIndicators.value = purchasedItems.map(item => ({
+            ...item,
+            type: 'python',
+            source: 'purchased'
           }))
         }
       } catch (error) {
@@ -1143,9 +1361,13 @@ export default {
           return
         }
 
+        // 用户传递的参数（来自参数配置弹窗）
+        const userParams = indicator.userParams || {}
+
         // 创建一个Python指标对象
         // 保存代码到局部变量，避免闭包问题
         const savedCode = pythonCode
+        const savedUserParams = { ...userParams } // 保存用户参数
         const pythonIndicator = {
           id: indicatorId, // 格式化后的ID（如 bought-1）
           name: indicator.name,
@@ -1153,6 +1375,7 @@ export default {
           code: savedCode,
           description: indicator.description,
           parsed: parsed, // 保存解析结果
+          userParams: savedUserParams, // 保存用户参数
           // 保存原始数据库ID和用户ID，用于解密
           originalId: indicator.id, // 数据库中的真实ID
           user_id: indicator.user_id || indicator.userId, // 用户ID
@@ -1161,7 +1384,8 @@ export default {
             // 通过 KlineChart 组件的 ref 访问 executePythonStrategy 函数
             // 使用savedCode确保每个指标使用自己的代码（避免闭包问题）
             // 传递完整的indicator信息用于解密
-            return klineChart.value.executePythonStrategy(savedCode, data, params, {
+            // 将用户参数直接合并到 params 中，让指标代码可以通过 params.get('name', default) 访问
+            return klineChart.value.executePythonStrategy(savedCode, data, { ...params, ...savedUserParams }, {
               id: indicator.id, // 使用原始数据库ID
               user_id: indicator.user_id || indicator.userId,
               is_encrypted: indicator.is_encrypted || indicator.isEncrypted || 0
@@ -1169,10 +1393,10 @@ export default {
           }
         }
 
-        const indicatorParams = { ...parsed.params }
+        const indicatorParamsFromParsed = { ...parsed.params, ...userParams }
         activeIndicators.value.push({
           ...pythonIndicator,
-          params: indicatorParams
+          params: indicatorParamsFromParsed
         })
         // KlineChart 组件会通过 watch activeIndicators 自动更新图表
       } catch (error) {
@@ -1181,13 +1405,109 @@ export default {
     }
 
     // 切换指标开关
-    const toggleIndicator = (indicator, source) => {
+    const toggleIndicator = async (indicator, source) => {
       const indicatorId = `${source}-${indicator.id}`
       if (isIndicatorActive(indicatorId)) {
         removeIndicator(indicatorId)
       } else {
-        addPythonIndicator(indicator, source)
+        // 检查指标是否有参数声明
+        try {
+          loadingParams.value = true
+          const res = await proxy.$http.get('/api/indicator/getIndicatorParams', {
+            params: { indicator_id: indicator.id }
+          })
+          if (res && res.code === 1 && Array.isArray(res.data) && res.data.length > 0) {
+            // 有参数，显示配置弹窗
+            indicatorParams.value = res.data
+            // 获取指标的唯一标识（用于保存参数值）
+            const indicatorKey = `${source}-${indicator.id}`
+            // 先检查是否有保存的参数值
+            const savedParams = savedIndicatorParams.value[indicatorKey]
+            // 先清空，然后逐个设置，确保响应式正常工作
+            const newParamValues = {}
+            res.data.forEach(p => {
+              // 如果有保存的值，使用保存的值；否则使用默认值
+              // 需要处理类型转换
+              let value = savedParams && savedParams[p.name] !== undefined
+                ? savedParams[p.name]
+                : p.default
+
+              // 根据参数类型进行类型转换
+              if (p.type === 'int') {
+                value = parseInt(value) || 0
+              } else if (p.type === 'float') {
+                value = parseFloat(value) || 0.0
+              } else if (p.type === 'bool') {
+                value = value === true || value === 'true' || value === 1 || value === '1'
+              } else {
+                value = value || ''
+              }
+
+              newParamValues[p.name] = value
+            })
+            // 一次性设置所有值，确保响应式更新
+            indicatorParamValues.value = newParamValues
+            pendingIndicator.value = indicator
+            pendingSource.value = source
+            showParamsModal.value = true
+          } else {
+            // 无参数，直接运行
+            addPythonIndicator(indicator, source)
+          }
+        } catch (err) {
+          console.warn('Failed to load indicator params:', err)
+          // 出错时直接运行
+          addPythonIndicator(indicator, source)
+        } finally {
+          loadingParams.value = false
+        }
       }
+    }
+
+    // 确认参数配置并运行指标
+    const confirmIndicatorParams = () => {
+      if (pendingIndicator.value) {
+        // 保存参数值（用于下次打开时使用）
+        const indicatorKey = `${pendingSource.value}-${pendingIndicator.value.id}`
+        savedIndicatorParams.value[indicatorKey] = { ...indicatorParamValues.value }
+
+        // 将参数传递给指标
+        const indicatorWithParams = {
+          ...pendingIndicator.value,
+          userParams: { ...indicatorParamValues.value }
+        }
+        addPythonIndicator(indicatorWithParams, pendingSource.value)
+      }
+      showParamsModal.value = false
+      pendingIndicator.value = null
+      pendingSource.value = ''
+    }
+
+    // 取消参数配置
+    const cancelIndicatorParams = () => {
+      // 保存参数值（在关闭前保存）
+      saveCurrentParams()
+      showParamsModal.value = false
+      // 延迟清空，确保 afterClose 能访问到数据
+      setTimeout(() => {
+        pendingIndicator.value = null
+        pendingSource.value = ''
+      }, 100)
+    }
+
+    // 保存当前参数值
+    const saveCurrentParams = () => {
+      if (pendingIndicator.value && pendingSource.value) {
+        const indicatorKey = `${pendingSource.value}-${pendingIndicator.value.id}`
+        // 深拷贝参数值，确保保存的是当前值
+        savedIndicatorParams.value[indicatorKey] = JSON.parse(JSON.stringify(indicatorParamValues.value))
+      }
+    }
+
+    // 弹窗关闭后的处理
+    const handleParamsModalAfterClose = () => {
+      // 确保参数值已保存
+      saveCurrentParams()
     }
 
     // 运行指标代码（从编辑器）
@@ -1327,6 +1647,91 @@ export default {
     const handleViewBacktestRun = (run) => {
       selectedBacktestRun.value = run
       showBacktestRunViewer.value = true
+    }
+
+    // 发布指标到社区
+    const handlePublishIndicator = (indicator) => {
+      publishIndicator.value = { ...indicator }
+      // 设置表单初始值
+      publishPricingType.value = indicator.pricing_type || 'free'
+      publishPrice.value = indicator.price || 10
+      publishDescription.value = indicator.description || ''
+      showPublishModal.value = true
+    }
+
+    // 确认发布
+    const handleConfirmPublish = async () => {
+      if (!userId.value) {
+        message.error(proxy.$t('dashboard.indicator.error.pleaseLogin'))
+        return
+      }
+
+      publishing.value = true
+      try {
+        const res = await request({
+          url: '/api/indicator/saveIndicator',
+          method: 'post',
+          data: {
+            userid: userId.value,
+            id: publishIndicator.value.id,
+            code: publishIndicator.value.code,
+            name: publishIndicator.value.name,
+            description: publishDescription.value,
+            publishToCommunity: true,
+            pricingType: publishPricingType.value,
+            price: publishPricingType.value === 'paid' ? publishPrice.value : 0
+          }
+        })
+
+        if (res.code === 1) {
+          message.success(proxy.$t('dashboard.indicator.publish.success'))
+          showPublishModal.value = false
+          publishIndicator.value = null
+          await loadIndicators()
+        } else {
+          message.error(res.msg || proxy.$t('dashboard.indicator.publish.failed'))
+        }
+      } catch (error) {
+        message.error(proxy.$t('dashboard.indicator.publish.failed') + ': ' + (error.message || ''))
+      } finally {
+        publishing.value = false
+      }
+    }
+
+    // 取消发布
+    const handleUnpublish = async () => {
+      if (!userId.value || !publishIndicator.value) return
+
+      unpublishing.value = true
+      try {
+        const res = await request({
+          url: '/api/indicator/saveIndicator',
+          method: 'post',
+          data: {
+            userid: userId.value,
+            id: publishIndicator.value.id,
+            code: publishIndicator.value.code,
+            name: publishIndicator.value.name,
+            description: publishIndicator.value.description,
+            publishToCommunity: false,
+            pricingType: 'free',
+            price: 0
+          }
+        })
+
+        if (res.code === 1) {
+          message.success(proxy.$t('dashboard.indicator.publish.unpublishSuccess'))
+          showPublishModal.value = false
+          publishIndicator.value = null
+          await loadIndicators()
+        } else {
+          message.error(res.msg || proxy.$t('dashboard.indicator.publish.unpublishFailed'))
+        }
+      } catch (error) {
+        message.error(proxy.$t('dashboard.indicator.publish.unpublishFailed'))
+      } finally {
+        unpublishing.value = false
+      }
     }
 
     // 保存指标到数据库
@@ -1537,6 +1942,28 @@ export default {
       }
     })
 
+    // 监听参数值变化，实时保存
+    watch(
+      () => indicatorParamValues.value,
+      (newVal) => {
+        // 只有在弹窗打开且有 pendingIndicator 时才保存
+        if (showParamsModal.value && pendingIndicator.value && pendingSource.value) {
+          const indicatorKey = `${pendingSource.value}-${pendingIndicator.value.id}`
+          // 深拷贝保存，避免引用问题
+          savedIndicatorParams.value[indicatorKey] = JSON.parse(JSON.stringify(newVal))
+        }
+      },
+      { deep: true, immediate: false }
+    )
+
+    // 监听参数配置弹窗关闭
+    watch(showParamsModal, (newVal) => {
+      if (!newVal) {
+        // 弹窗关闭时，确保参数值已保存
+        saveCurrentParams()
+      }
+    })
+
     return {
       userId,
       klineChart,
@@ -1556,6 +1983,7 @@ loadingWatchlist,
       trendIndicators,
       oscillatorIndicators,
       customIndicators,
+      purchasedIndicators,
       loadingIndicators,
       realtimeEnabled,
 toggleRealtime,
@@ -1588,9 +2016,19 @@ getMarketColor,
       handleDeleteIndicator,
       toggleCustomSection,
       customSectionCollapsed,
+      purchasedSectionCollapsed,
       handlePriceChange,
       handleChartRetry,
       handleIndicatorToggle,
+      // 指标参数配置相关
+      showParamsModal,
+      pendingIndicator,
+      indicatorParams,
+      indicatorParamValues,
+      loadingParams,
+      confirmIndicatorParams,
+      cancelIndicatorParams,
+      handleParamsModalAfterClose,
       // 回测相关
       showBacktestModal,
       backtestIndicator,
@@ -1602,6 +2040,18 @@ getMarketColor,
       showBacktestRunViewer,
       selectedBacktestRun,
       handleViewBacktestRun,
+      // 发布到社区相关
+      showPublishModal,
+      publishIndicator,
+      publishing,
+      unpublishing,
+      publishPricingType,
+      publishPrice,
+      publishDescription,
+      publishRules,
+      handlePublishIndicator,
+      handleConfirmPublish,
+      handleUnpublish,
       // 暴露给回测弹窗使用的选中值
       selectedSymbol: currentSymbol,
       selectedMarket: currentMarket,
@@ -2110,6 +2560,19 @@ getMarketColor,
     color: #13c2c2;
     &:hover {
       color: #08979c;
+    }
+  }
+
+  &.publish-icon {
+    color: #1890ff;
+    &:hover {
+      color: #40a9ff;
+    }
+    &.published {
+      color: #52c41a;
+      &:hover {
+        color: #73d13d;
+      }
     }
   }
 
@@ -2739,6 +3202,19 @@ getMarketColor,
             }
           }
 
+          &.publish-icon {
+            color: #1890ff;
+            &:hover {
+              color: #40a9ff;
+            }
+            &.published {
+              color: #52c41a;
+              &:hover {
+                color: #73d13d;
+              }
+            }
+          }
+
           &.toggle-icon.active {
             color: #52c41a;
           }
@@ -2930,6 +3406,47 @@ getMarketColor,
         }
       }
     }
+  }
+}
+
+/* 指标参数配置弹窗 */
+.params-config-modal {
+  .indicator-info {
+    text-align: center;
+    margin-bottom: 8px;
+
+    .indicator-name {
+      font-size: 16px;
+      font-weight: 600;
+      color: #1f1f1f;
+    }
+  }
+
+  .params-form {
+    .param-item {
+      margin-bottom: 16px;
+
+      .param-header {
+        display: flex;
+        align-items: center;
+        margin-bottom: 6px;
+
+        .param-label {
+          font-weight: 500;
+          color: #333;
+        }
+      }
+    }
+  }
+}
+
+.theme-dark .params-config-modal {
+  .indicator-info .indicator-name {
+    color: #e0e0e0;
+  }
+
+  .params-form .param-item .param-header .param-label {
+    color: #d0d0d0;
   }
 }
 </style>

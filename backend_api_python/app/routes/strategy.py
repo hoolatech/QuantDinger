@@ -316,8 +316,29 @@ def get_trades():
             )
             rows = cur.fetchall() or []
             cur.close()
+        
+        # Convert created_at to UTC timestamp (seconds) for frontend
+        # This ensures consistent timezone handling
+        processed_rows = []
+        for row in rows:
+            trade = dict(row)
+            created_at = trade.get('created_at')
+            if created_at:
+                if hasattr(created_at, 'timestamp'):
+                    # datetime object - convert to UTC timestamp
+                    trade['created_at'] = int(created_at.timestamp())
+                elif isinstance(created_at, str):
+                    # ISO string - parse and convert
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        trade['created_at'] = int(dt.timestamp())
+                    except Exception:
+                        pass
+            processed_rows.append(trade)
+        
         # Frontend expects data.trades; keep data.items for compatibility with list-style components.
-        return jsonify({'code': 1, 'msg': 'success', 'data': {'trades': rows, 'items': rows}})
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'trades': processed_rows, 'items': processed_rows}})
     except Exception as e:
         logger.error(f"get_trades failed: {str(e)}")
         logger.error(traceback.format_exc())
@@ -406,6 +427,11 @@ def get_positions():
                 pct = _calc_pnl_percent(entry, size, pnl)
 
                 rr = dict(r)
+                # 确保 entry_price 有值（如果数据库中是 NULL，使用计算出的 entry 值）
+                if not rr.get("entry_price") or float(rr.get("entry_price") or 0.0) <= 0:
+                    rr["entry_price"] = float(entry or 0.0)
+                else:
+                    rr["entry_price"] = float(rr.get("entry_price") or 0.0)
                 rr["current_price"] = float(cp or 0.0)
                 rr["unrealized_pnl"] = float(pnl)
                 rr["pnl_percent"] = float(pct)
@@ -795,9 +821,6 @@ def get_strategy_notifications():
             user_strategy_ids = [r.get('id') for r in rows if r.get('id')]
             cur.close()
         
-        if not user_strategy_ids:
-            return jsonify({'code': 1, 'msg': 'success', 'data': {'items': []}})
-
         where = []
         args = []
         
@@ -809,9 +832,15 @@ def get_strategy_notifications():
             else:
                 return jsonify({'code': 1, 'msg': 'success', 'data': {'items': []}})
         else:
-            placeholders = ",".join(["?"] * len(user_strategy_ids))
-            where.append(f"strategy_id IN ({placeholders})")
-            args.extend(user_strategy_ids)
+            if user_strategy_ids:
+                placeholders = ",".join(["?"] * len(user_strategy_ids))
+                where.append(f"(strategy_id IN ({placeholders}) OR (strategy_id IS NULL AND user_id = ?))")
+                args.extend(user_strategy_ids)
+                args.append(user_id)
+            else:
+                # Only portfolio monitor notifications (strategy_id is NULL)
+                where.append("strategy_id IS NULL AND user_id = ?")
+                args.append(user_id)
         
         if since_id:
             where.append("id > ?")
@@ -833,7 +862,24 @@ def get_strategy_notifications():
             rows = cur.fetchall() or []
             cur.close()
 
-        return jsonify({'code': 1, 'msg': 'success', 'data': {'items': rows}})
+        # Convert created_at to UTC timestamp (seconds) for frontend
+        processed_rows = []
+        for row in rows:
+            item = dict(row)
+            created_at = item.get('created_at')
+            if created_at:
+                if hasattr(created_at, 'timestamp'):
+                    item['created_at'] = int(created_at.timestamp())
+                elif isinstance(created_at, str):
+                    try:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        item['created_at'] = int(dt.timestamp())
+                    except Exception:
+                        pass
+            processed_rows.append(item)
+
+        return jsonify({'code': 1, 'msg': 'success', 'data': {'items': processed_rows}})
     except Exception as e:
         logger.error(f"get_strategy_notifications failed: {str(e)}")
         logger.error(traceback.format_exc())
@@ -851,15 +897,18 @@ def mark_notification_read():
         if not notification_id:
             return jsonify({'code': 0, 'msg': 'Missing id'}), 400
 
-        # Only update notifications for user's strategies
+        # Update notifications for user's strategies OR portfolio monitor notifications
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
                 """
                 UPDATE qd_strategy_notifications SET is_read = 1 
-                WHERE id = ? AND strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                WHERE id = ? AND (
+                    strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                    OR (strategy_id IS NULL AND user_id = ?)
+                )
                 """,
-                (int(notification_id), user_id)
+                (int(notification_id), user_id, user_id)
             )
             db.commit()
             cur.close()
@@ -882,8 +931,9 @@ def mark_all_notifications_read():
                 """
                 UPDATE qd_strategy_notifications SET is_read = 1 
                 WHERE strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                   OR (strategy_id IS NULL AND user_id = ?)
                 """,
-                (user_id,)
+                (user_id, user_id)
             )
             db.commit()
             cur.close()
@@ -906,8 +956,9 @@ def clear_notifications():
                 """
                 DELETE FROM qd_strategy_notifications 
                 WHERE strategy_id IN (SELECT id FROM qd_strategies_trading WHERE user_id = ?)
+                   OR (strategy_id IS NULL AND user_id = ?)
                 """,
-                (user_id,)
+                (user_id, user_id)
             )
             db.commit()
             cur.close()
