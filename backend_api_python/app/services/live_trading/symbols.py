@@ -14,12 +14,28 @@ from typing import Dict, Tuple
 
 
 def _split_base_quote(symbol: str) -> Tuple[str, str]:
+    """
+    分割符号为基础货币和报价货币。
+    
+    处理各种格式：
+    - BTC/USDT -> (BTC, USDT)
+    - BTCUSDT -> (BTCUSDT, "") - 需要进一步处理
+    - PI, TRX -> (PI, "") - 需要进一步处理
+    """
     s = (symbol or "").strip()
     if ":" in s:
         s = s.split(":", 1)[0]
     if "/" not in s:
-        # Already exchange-specific (best-effort)
-        return s, ""
+        # 尝试识别报价货币（常见格式：BASEQUOTE）
+        s_upper = s.upper()
+        common_quotes = ['USDT', 'USD', 'BTC', 'ETH', 'BUSD', 'USDC', 'BNB']
+        for quote in common_quotes:
+            if s_upper.endswith(quote) and len(s_upper) > len(quote):
+                base = s_upper[:-len(quote)]
+                if base:
+                    return base, quote
+        # 无法识别，返回原符号和空报价
+        return s_upper, ""
     base, quote = s.split("/", 1)
     return base.strip().upper(), quote.strip().upper()
 
@@ -56,11 +72,6 @@ def to_bitget_um_symbol(symbol: str) -> str:
 _KRAKEN_BASE_MAP: Dict[str, str] = {
     # Common spot naming differences
     "BTC": "XBT",
-}
-
-_BITFINEX_QUOTE_MAP: Dict[str, str] = {
-    # Bitfinex uses "UST" for Tether USDt
-    "USDT": "UST",
 }
 
 _KUCOIN_FUTURES_BASE_MAP: Dict[str, str] = {
@@ -161,30 +172,6 @@ def to_gate_currency_pair(symbol: str) -> str:
     return f"{base}_{quote}"
 
 
-def to_bitfinex_spot_symbol(symbol: str) -> str:
-    """
-    Bitfinex spot trading symbol format: tBASEQUOTE, e.g. tBTCUST.
-    """
-    base, quote = _split_base_quote(symbol)
-    if not base or not quote:
-        s = str(symbol or "").strip()
-        return s if s.startswith("t") else f"t{s}"
-    q = _BITFINEX_QUOTE_MAP.get(quote, quote)
-    return f"t{base}{q}"
-
-
-def to_bitfinex_perp_symbol(symbol: str) -> str:
-    """
-    Bitfinex derivatives perpetual naming (best-effort): tBASEF0:QUOTEF0, e.g. tBTCF0:USTF0.
-    """
-    base, quote = _split_base_quote(symbol)
-    if not base or not quote:
-        s = str(symbol or "").strip()
-        return s if s.startswith("t") else f"t{s}"
-    q = _BITFINEX_QUOTE_MAP.get(quote, quote)
-    return f"t{base}F0:{q}F0"
-
-
 def to_deepcoin_symbol(symbol: str) -> str:
     """
     Deepcoin symbol format: typically BASE-QUOTE for spot, BASE-QUOTE-SWAP for perpetual.
@@ -219,4 +206,29 @@ def to_deepcoin_swap_symbol(symbol: str) -> str:
     if base_symbol.endswith("-SWAP"):
         return base_symbol
     return f"{base_symbol}-SWAP"
+
+
+def to_htx_spot_symbol(symbol: str) -> str:
+    """
+    HTX spot symbol format: lowercase concatenated, e.g. btcusdt.
+    """
+    base, quote = _split_base_quote(symbol)
+    if not base or not quote:
+        return str(symbol or "").replace("/", "").replace(":", "").lower()
+    return f"{base}{quote}".lower()
+
+
+def to_htx_contract_code(symbol: str) -> str:
+    """
+    HTX USDT-margined swap contract code: BASE-QUOTE, e.g. BTC-USDT.
+    """
+    s = str(symbol or "").strip()
+    if not s:
+        return s
+    if "-" in s and "/" not in s:
+        return s.upper()
+    base, quote = _split_base_quote(symbol)
+    if not base or not quote:
+        return s.replace("/", "-").replace(":", "-").upper()
+    return f"{base}-{quote}"
 

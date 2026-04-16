@@ -45,6 +45,9 @@ def _format_datetime(dt: Any) -> Any:
     if dt is None:
         return None
     if hasattr(dt, 'isoformat'):
+        from datetime import timezone as _tz
+        if hasattr(dt, 'tzinfo') and getattr(dt, 'tzinfo', None) is None:
+            dt = dt.replace(tzinfo=_tz.utc)
         return dt.isoformat()
     return dt
 
@@ -81,6 +84,14 @@ def _as_list(value: Any) -> List[str]:
     return []
 
 
+def _is_bot_strategy(row: Dict[str, Any]) -> bool:
+    try:
+        mode = str((row or {}).get("strategy_mode") or "").strip().lower()
+        return mode == "bot"
+    except Exception:
+        return False
+
+
 def _calc_unrealized_pnl(side: str, entry_price: float, current_price: float, size: float) -> float:
     try:
         ep = float(entry_price or 0.0)
@@ -113,9 +124,12 @@ def _calc_pnl_percent(entry_price: float, size: float, pnl: float, leverage: flo
         return 0.0
 
 
-def _compute_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _compute_performance_stats(trades: List[Dict[str, Any]], initial_capital: float = 0.0) -> Dict[str, Any]:
     """
     Compute performance statistics from trade history.
+    Args:
+        trades: List of trade records
+        initial_capital: Initial capital for calculating equity curve (default: 0.0, will use cumulative profit peak as baseline)
     Returns: {
         total_trades, winning_trades, losing_trades, win_rate,
         total_profit, total_loss, profit_factor,
@@ -163,23 +177,49 @@ def _compute_performance_stats(trades: List[Dict[str, Any]]) -> Dict[str, Any]:
     max_win = max(profits) if profits else 0.0
     max_loss = min(profits) if profits else 0.0
 
-    # Calculate max drawdown from cumulative equity
-    cumulative = []
-    acc = 0.0
+    # Calculate max drawdown from equity curve (initial_capital + cumulative profit)
+    # This ensures proper percentage calculation even when cumulative profit is negative
+    cumulative_profit = 0.0
+    equity_curve = []
     for p in profits:
-        acc += p
-        cumulative.append(acc)
+        cumulative_profit += p
+        equity = initial_capital + cumulative_profit
+        equity_curve.append(equity)
 
-    peak = 0.0
+    # Calculate max drawdown from equity curve
+    peak_equity = initial_capital if initial_capital > 0 else (equity_curve[0] if equity_curve else 0.0)
     max_drawdown = 0.0
-    for val in cumulative:
-        if val > peak:
-            peak = val
-        dd = peak - val
-        if dd > max_drawdown:
-            max_drawdown = dd
+    for equity in equity_curve:
+        if equity > peak_equity:
+            peak_equity = equity
+        # Drawdown is the drop from peak
+        drawdown = peak_equity - equity
+        if drawdown > max_drawdown:
+            max_drawdown = drawdown
 
-    max_drawdown_pct = (max_drawdown / peak * 100) if peak > 0 else 0.0
+    # Calculate drawdown percentage: drawdown / peak_equity * 100
+    # If peak_equity is 0 or very small, use a fallback calculation
+    if peak_equity > 0:
+        max_drawdown_pct = (max_drawdown / peak_equity * 100)
+    elif initial_capital > 0:
+        # Fallback: use initial capital as baseline
+        max_drawdown_pct = (max_drawdown / initial_capital * 100) if initial_capital > 0 else 0.0
+    else:
+        # Last resort: if no initial capital and peak is 0, calculate from cumulative profit peak
+        cumulative = []
+        acc = 0.0
+        for p in profits:
+            acc += p
+            cumulative.append(acc)
+        peak_profit = max(cumulative) if cumulative else 0.0
+        if peak_profit > 0:
+            max_drawdown_pct = (max_drawdown / peak_profit * 100)
+        else:
+            max_drawdown_pct = 0.0
+    
+    # Cap drawdown percentage at reasonable maximum (e.g., 10000%) to avoid display issues
+    if max_drawdown_pct > 10000:
+        max_drawdown_pct = 10000.0
 
     # Best/worst day
     day_profits: Dict[str, float] = {}
@@ -243,9 +283,9 @@ def _compute_strategy_stats(trades: List[Dict[str, Any]], strategies: List[Dict[
 
     result = []
     for sid, strades in sid_to_trades.items():
-        stats = _compute_performance_stats(strades)
-        total_pnl = sum(_safe_float(t.get("profit"), 0.0) for t in strades)
         capital = sid_to_capital.get(sid, 0.0)
+        stats = _compute_performance_stats(strades, initial_capital=capital)
+        total_pnl = sum(_safe_float(t.get("profit"), 0.0) for t in strades)
         roi = (total_pnl / capital * 100) if capital > 0 else 0.0
 
         result.append({
@@ -268,7 +308,7 @@ def _compute_strategy_stats(trades: List[Dict[str, Any]], strategies: List[Dict[
 @login_required
 def summary():
     """
-    Return dashboard summary used by `quantdinger_vue/src/views/dashboard/index.vue`.
+    Return dashboard summary used by the frontend dashboard view (private Vue repo).
     """
     try:
         user_id = g.user_id
@@ -278,7 +318,7 @@ def summary():
             cur = db.cursor()
             cur.execute(
                 """
-                SELECT id, strategy_name, strategy_type, status, initial_capital, trading_config
+                SELECT id, strategy_name, strategy_type, status, initial_capital, trading_config, strategy_mode
                 FROM qd_strategies_trading
                 WHERE user_id = ?
                 """,
@@ -287,6 +327,7 @@ def summary():
             strategies = cur.fetchall() or []
             cur.close()
 
+        strategies = [s for s in strategies if not _is_bot_strategy(s)]
         running = [s for s in strategies if (s.get("status") or "").strip().lower() == "running"]
         indicator_strategy_count = len([s for s in running if (s.get("strategy_type") or "") == "IndicatorStrategy"])
 
@@ -314,11 +355,13 @@ def summary():
                 """
                 SELECT p.*, s.strategy_name, s.initial_capital, s.leverage, s.market_type
                 FROM qd_strategy_positions p
-                LEFT JOIN qd_strategies_trading s ON s.id = p.strategy_id
+                INNER JOIN qd_strategies_trading s ON s.id = p.strategy_id
                 WHERE p.user_id = ?
+                  AND s.user_id = ?
+                  AND COALESCE(LOWER(TRIM(s.strategy_mode)), 'signal') <> 'bot'
                 ORDER BY p.updated_at DESC
                 """,
-                (user_id,)
+                (user_id, user_id)
             )
             rows = cur.fetchall() or []
             cur.close()
@@ -350,43 +393,68 @@ def summary():
             )
 
         # Recent trades (best-effort, filtered by user_id)
+        # Also compute all-time trade count for dashboard top cards.
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT COUNT(1) AS cnt
+                FROM qd_strategy_trades t
+                INNER JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                WHERE t.user_id = ?
+                  AND s.user_id = ?
+                  AND COALESCE(LOWER(TRIM(s.strategy_mode)), 'signal') <> 'bot'
+                """,
+                (user_id, user_id)
+            )
+            total_trades_all = int((cur.fetchone() or {}).get("cnt") or 0)
+            cur.close()
+
         with get_db_connection() as db:
             cur = db.cursor()
             cur.execute(
                 """
                 SELECT t.*, s.strategy_name
                 FROM qd_strategy_trades t
-                LEFT JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                INNER JOIN qd_strategies_trading s ON s.id = t.strategy_id
                 WHERE t.user_id = ?
+                  AND s.user_id = ?
+                  AND COALESCE(LOWER(TRIM(s.strategy_mode)), 'signal') <> 'bot'
                 ORDER BY t.created_at DESC
                 LIMIT 500
                 """,
-                (user_id,)
+                (user_id, user_id)
             )
             recent_trades_raw = cur.fetchall() or []
             cur.close()
         
         # Convert datetime to timestamp for frontend compatibility
+        from datetime import timezone as _tz
         recent_trades = []
         for t in recent_trades_raw:
             trade = dict(t)
-            if trade.get('created_at') and hasattr(trade['created_at'], 'timestamp'):
-                trade['created_at'] = int(trade['created_at'].timestamp())
+            ca = trade.get('created_at')
+            if ca and hasattr(ca, 'timestamp'):
+                if getattr(ca, 'tzinfo', None) is None:
+                    ca = ca.replace(tzinfo=_tz.utc)
+                trade['created_at'] = int(ca.timestamp())
             recent_trades.append(trade)
 
-        # Compute performance statistics
-        perf_stats = _compute_performance_stats(recent_trades)
-
-        # Compute per-strategy statistics
-        strategy_stats = _compute_strategy_stats(recent_trades, strategies)
-
-        # Total equity/pnl (best-effort)
+        # Total equity/pnl (best-effort) - calculate before performance stats for drawdown calculation
         total_initial_capital = 0.0
         for s in strategies:
             try:
                 total_initial_capital += float(s.get("initial_capital") or 0.0)
             except Exception:
                 pass
+
+        # Compute performance statistics with initial capital for proper drawdown calculation
+        perf_stats = _compute_performance_stats(recent_trades, initial_capital=total_initial_capital)
+        # For dashboard top card: show all-time total trade count (not limited by LIMIT 500).
+        perf_stats["total_trades"] = int(total_trades_all)
+
+        # Compute per-strategy statistics
+        strategy_stats = _compute_strategy_stats(recent_trades, strategies)
 
         # Include realized PnL from trades
         total_realized_pnl = sum(_safe_float(t.get("profit"), 0.0) for t in recent_trades)

@@ -5,10 +5,12 @@ Admin-only endpoints for system configuration management.
 """
 import os
 import re
+import importlib
 from flask import Blueprint, request, jsonify
 from app.utils.logger import get_logger
 from app.utils.config_loader import clear_config_cache
 from app.utils.auth import login_required, admin_required
+from dotenv import load_dotenv
 
 logger = get_logger(__name__)
 
@@ -17,43 +19,69 @@ settings_bp = Blueprint('settings', __name__)
 # .env 文件路径
 ENV_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), '.env')
 
-# 配置项定义（分组）- 按功能模块划分，每个配置项包含描述
-CONFIG_SCHEMA = {
-    # ==================== 1. 服务配置 ====================
-    'server': {
-        'title': 'Server Configuration',
-        'icon': 'cloud-server',
-        'order': 1,
-        'items': [
-            {
-                'key': 'PYTHON_API_HOST',
-                'label': 'Listen Address',
-                'type': 'text',
-                'default': '0.0.0.0',
-                'description': 'Server listen address. 0.0.0.0 allows external access, 127.0.0.1 for local only'
-            },
-            {
-                'key': 'PYTHON_API_PORT',
-                'label': 'Port',
-                'type': 'number',
-                'default': '5000',
-                'description': 'Server listen port, default 5000'
-            },
-            {
-                'key': 'PYTHON_API_DEBUG',
-                'label': 'Debug Mode',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'Enable debug mode for development. Disable in production'
-            },
-        ]
-    },
 
-    # ==================== 2. 安全认证 ====================
+def _reload_runtime_env() -> None:
+    """
+    Reload .env into current process so settings take effect immediately.
+    Priority keeps backend_api_python/.env over repo-root/.env.
+    """
+    backend_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+    root_dir = os.path.dirname(backend_dir)
+
+    # Load root first, then backend .env to keep backend file higher priority
+    load_dotenv(os.path.join(root_dir, '.env'), override=True)
+    load_dotenv(os.path.join(backend_dir, '.env'), override=True)
+
+
+def _refresh_runtime_services() -> None:
+    """
+    Reset singleton services so new env/config is picked up lazily
+    on next request without restarting the Python process.
+    """
+    # Prefer dedicated reset function where available.
+    try:
+        search_mod = importlib.import_module('app.services.search')
+        if hasattr(search_mod, 'reset_search_service'):
+            search_mod.reset_search_service()
+    except Exception as e:
+        logger.warning(f"reset_search_service skipped: {e}")
+
+    # Generic singleton fields used across services.
+    singleton_fields = [
+        ('app.services.fast_analysis', '_fast_analysis_service'),
+        ('app.services.billing_service', '_billing_service'),
+        ('app.services.security_service', '_security_service'),
+        ('app.services.oauth_service', '_oauth_service'),
+        ('app.services.user_service', '_user_service'),
+        ('app.services.email_service', '_email_service'),
+        ('app.services.community_service', '_community_service'),
+        ('app.services.usdt_payment_service', '_svc'),
+        ('app.services.usdt_payment_service', '_worker'),
+        ('app.services.analysis_memory', '_memory_instance'),
+    ]
+
+    for module_name, field_name in singleton_fields:
+        try:
+            mod = importlib.import_module(module_name)
+            if hasattr(mod, field_name):
+                setattr(mod, field_name, None)
+        except Exception as e:
+            logger.warning(f"Singleton reset skipped: {module_name}.{field_name}: {e}")
+
+# 配置项定义（分组）- 按功能模块划分，每个配置项包含描述
+# ---------------------------------------------------------------
+# 精简原则：
+#   - 部署级配置（host/port/debug）不在 UI 暴露，用户通过 .env 或 docker-compose 设置
+#   - 内部调优参数（超时/重试/tick间隔/向量维度等）使用默认值即可，不暴露给普通用户
+#   - 只保留用户真正需要配置的功能开关和 API Key
+# ---------------------------------------------------------------
+CONFIG_SCHEMA = {
+
+    # ==================== 1. 安全认证 ====================
     'auth': {
         'title': 'Security & Authentication',
         'icon': 'lock',
-        'order': 2,
+        'order': 1,
         'items': [
             {
                 'key': 'SECRET_KEY',
@@ -86,11 +114,11 @@ CONFIG_SCHEMA = {
         ]
     },
 
-    # ==================== 3. AI/LLM 配置 ====================
+    # ==================== 2. AI/LLM 配置 ====================
     'ai': {
-        'title': 'AI / LLM Configuration',
+        'title': 'AI / LLM & Search',
         'icon': 'robot',
-        'order': 3,
+        'order': 2,
         'items': [
             {
                 'key': 'LLM_PROVIDER',
@@ -105,6 +133,14 @@ CONFIG_SCHEMA = {
                     {'value': 'grok', 'label': 'xAI Grok'},
                 ],
                 'description': 'Select your preferred LLM provider'
+            },
+            {
+                'key': 'AI_CODE_GEN_MODEL',
+                'label': 'Code Generation Model',
+                'type': 'text',
+                'default': '',
+                'required': False,
+                'description': 'Optional model override for AI code generation. If empty, uses provider default model'
             },
             # OpenRouter
             {
@@ -236,50 +272,89 @@ CONFIG_SCHEMA = {
                 'description': 'Model creativity (0-1). Lower = more deterministic'
             },
             {
-                'key': 'OPENROUTER_TIMEOUT',
-                'label': 'Request Timeout (sec)',
-                'type': 'number',
-                'default': '300',
-                'description': 'API request timeout in seconds'
+                'key': 'AI_ANALYSIS_CONSENSUS_TIMEFRAMES',
+                'label': 'Consensus Timeframes',
+                'type': 'text',
+                'default': '1D,4H',
+                'required': False,
+                'description': 'Multi-timeframe consensus for fast AI analysis. Comma-separated, e.g. "1D,4H"'
             },
             {
-                'key': 'AI_MODELS_JSON',
-                'label': 'Custom Models (JSON)',
-                'type': 'text',
-                'default': '{}',
+                'key': 'SEARCH_PROVIDER',
+                'label': 'Search Provider',
+                'type': 'select',
+                'options': ['tavily', 'google', 'bing', 'none'],
+                'default': 'google',
+                'description': 'News / web search provider used by AI analysis. Configure both LLM and search to get full AI analysis results'
+            },
+            {
+                'key': 'SEARCH_MAX_RESULTS',
+                'label': 'Search Max Results',
+                'type': 'number',
+                'default': '10',
+                'description': 'Maximum number of search/news results returned per AI analysis request'
+            },
+            {
+                'key': 'TAVILY_API_KEYS',
+                'label': 'Tavily API Keys',
+                'type': 'password',
                 'required': False,
-                'description': 'Custom model list in JSON format for model selector'
+                'link': 'https://tavily.com/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Tavily search API keys (comma-separated). Recommended lightweight search source for AI analysis'
+            },
+            {
+                'key': 'SEARCH_GOOGLE_API_KEY',
+                'label': 'Google Search API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://console.cloud.google.com/apis/credentials',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Google Custom Search JSON API key'
+            },
+            {
+                'key': 'SEARCH_GOOGLE_CX',
+                'label': 'Google Search Engine ID (CX)',
+                'type': 'text',
+                'required': False,
+                'link': 'https://programmablesearchengine.google.com/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Google Programmable Search Engine ID'
+            },
+            {
+                'key': 'SEARCH_BING_API_KEY',
+                'label': 'Bing Search API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://portal.azure.com/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Microsoft Bing Web Search API key'
+            },
+            {
+                'key': 'SERPAPI_KEYS',
+                'label': 'SerpAPI Keys',
+                'type': 'password',
+                'required': False,
+                'link': 'https://serpapi.com/',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'SerpAPI keys (comma-separated)'
             },
         ]
     },
 
-    # ==================== 4. 实盘交易 ====================
+    # ==================== 3. 实盘交易 ====================
     'trading': {
         'title': 'Live Trading',
         'icon': 'stock',
-        'order': 4,
+        'order': 3,
         'items': [
-            {
-                'key': 'ENABLE_PENDING_ORDER_WORKER',
-                'label': 'Enable Order Worker',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Enable background order processing worker for live trading'
-            },
-            {
-                'key': 'PENDING_ORDER_STALE_SEC',
-                'label': 'Order Stale Timeout (sec)',
-                'type': 'number',
-                'default': '90',
-                'description': 'Mark pending order as stale after this many seconds'
-            },
             {
                 'key': 'ORDER_MODE',
                 'label': 'Order Execution Mode',
                 'type': 'select',
-                'options': ['maker', 'market'],
-                'default': 'maker',
-                'description': 'maker: Limit order first (lower fees), market: Market order (instant fill)'
+                'options': ['market', 'maker'],
+                'default': 'market',
+                'description': 'market: Market order (instant fill, recommended), maker: Limit order first (lower fees but may not fill)'
             },
             {
                 'key': 'MAKER_WAIT_SEC',
@@ -288,95 +363,23 @@ CONFIG_SCHEMA = {
                 'default': '10',
                 'description': 'Wait time for limit order fill before switching to market order'
             },
-            {
-                'key': 'MAKER_OFFSET_BPS',
-                'label': 'Limit Order Offset (bps)',
-                'type': 'number',
-                'default': '2',
-                'description': 'Price offset in basis points (1bps=0.01%). Buy: price*(1-offset), Sell: price*(1+offset)'
-            },
         ]
     },
 
-    # ==================== 5. 策略执行 ====================
-    'strategy': {
-        'title': 'Strategy Execution',
-        'icon': 'fund',
-        'order': 5,
-        'items': [
-            {
-                'key': 'DISABLE_RESTORE_RUNNING_STRATEGIES',
-                'label': 'Disable Auto Restore',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'Disable automatic restore of running strategies on server restart'
-            },
-            {
-                'key': 'STRATEGY_TICK_INTERVAL_SEC',
-                'label': 'Tick Interval (sec)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Strategy main loop tick interval in seconds'
-            },
-            {
-                'key': 'PRICE_CACHE_TTL_SEC',
-                'label': 'Price Cache TTL (sec)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Time-to-live for cached price data in seconds'
-            },
-        ]
-    },
-
-    # ==================== 6. 数据源配置 ====================
+    # ==================== 4. 数据源配置 ====================
     'data_source': {
         'title': 'Data Sources',
         'icon': 'database',
-        'order': 6,
+        'order': 4,
         'items': [
             {
-                'key': 'DATA_SOURCE_TIMEOUT',
-                'label': 'Default Timeout (sec)',
-                'type': 'number',
-                'default': '30',
-                'description': 'Default timeout for all data source requests'
-            },
-            {
-                'key': 'DATA_SOURCE_RETRY',
-                'label': 'Retry Count',
-                'type': 'number',
-                'default': '3',
-                'description': 'Number of retry attempts on data source failure'
-            },
-            {
-                'key': 'DATA_SOURCE_RETRY_BACKOFF',
-                'label': 'Retry Backoff (sec)',
-                'type': 'number',
-                'default': '0.5',
-                'description': 'Backoff time between retry attempts'
-            },
-            {
                 'key': 'CCXT_DEFAULT_EXCHANGE',
-                'label': 'CCXT Default Exchange',
+                'label': 'Default Crypto Exchange',
                 'type': 'text',
                 'default': 'coinbase',
                 'link': 'https://github.com/ccxt/ccxt#supported-cryptocurrency-exchange-markets',
                 'link_text': 'settings.link.supportedExchanges',
-                'description': 'Default exchange for CCXT crypto data (binance, coinbase, okx, etc.)'
-            },
-            {
-                'key': 'CCXT_TIMEOUT',
-                'label': 'CCXT Timeout (ms)',
-                'type': 'number',
-                'default': '10000',
-                'description': 'CCXT request timeout in milliseconds'
-            },
-            {
-                'key': 'CCXT_PROXY',
-                'label': 'CCXT Proxy',
-                'type': 'text',
-                'required': False,
-                'description': 'Proxy URL for CCXT requests (e.g. socks5h://127.0.0.1:1080)'
+                'description': 'Default exchange for crypto data (binance, coinbase, okx, etc.)'
             },
             {
                 'key': 'FINNHUB_API_KEY',
@@ -388,18 +391,22 @@ CONFIG_SCHEMA = {
                 'description': 'Finnhub API key for US stock data (free tier available)'
             },
             {
-                'key': 'FINNHUB_TIMEOUT',
-                'label': 'Finnhub Timeout (sec)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Finnhub API request timeout'
+                'key': 'COINGLASS_API_KEY',
+                'label': 'Coinglass API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://docs.coinglass.com/reference/getting-started-with-your-api',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Coinglass API key for crypto derivatives, funding rate, long/short ratio, and exchange flow data. Open the official docs to view signup and key management instructions.'
             },
             {
-                'key': 'FINNHUB_RATE_LIMIT',
-                'label': 'Finnhub Rate Limit',
-                'type': 'number',
-                'default': '60',
-                'description': 'Finnhub API rate limit (requests per minute)'
+                'key': 'CRYPTOQUANT_API_KEY',
+                'label': 'CryptoQuant API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://cryptoquant.com/docs',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'CryptoQuant API key for on-chain and stablecoin flow metrics used in crypto AI analysis. API access is tied to paid plans; see the official docs for activation details.'
             },
             {
                 'key': 'TIINGO_API_KEY',
@@ -408,37 +415,25 @@ CONFIG_SCHEMA = {
                 'required': False,
                 'link': 'https://www.tiingo.com/account/api/token',
                 'link_text': 'settings.link.getToken',
-                'description': 'Tiingo API key for Forex/Metals data (free tier does not support 1-minute data)'
+                'description': 'Tiingo API key for Forex/Metals data'
             },
             {
-                'key': 'TIINGO_TIMEOUT',
-                'label': 'Tiingo Timeout (sec)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Tiingo API request timeout'
-            },
-            {
-                'key': 'AKSHARE_TIMEOUT',
-                'label': 'Akshare Timeout (sec)',
-                'type': 'number',
-                'default': '30',
-                'description': 'Akshare API timeout for China A-share data'
-            },
-            {
-                'key': 'YFINANCE_TIMEOUT',
-                'label': 'YFinance Timeout (sec)',
-                'type': 'number',
-                'default': '30',
-                'description': 'Yahoo Finance API timeout'
+                'key': 'TWELVE_DATA_API_KEY',
+                'label': 'Twelve Data API Key',
+                'type': 'password',
+                'required': False,
+                'link': 'https://twelvedata.com/apikey',
+                'link_text': 'settings.link.getApiKey',
+                'description': 'Twelve Data API key for CN/HK stock K-lines (free 800 credits/day)'
             },
         ]
     },
 
-    # ==================== 7. 邮件配置 (公共 SMTP) ====================
+    # ==================== 5. 邮件配置 ====================
     'email': {
         'title': 'Email (SMTP)',
         'icon': 'mail',
-        'order': 7,
+        'order': 5,
         'items': [
             {
                 'key': 'SMTP_HOST',
@@ -452,7 +447,7 @@ CONFIG_SCHEMA = {
                 'label': 'SMTP Port',
                 'type': 'number',
                 'default': '587',
-                'description': 'SMTP port (587 for TLS, 465 for SSL, 25 for plain)'
+                'description': 'SMTP port (587 for TLS, 465 for SSL)'
             },
             {
                 'key': 'SMTP_USER',
@@ -492,11 +487,11 @@ CONFIG_SCHEMA = {
         ]
     },
 
-    # ==================== 9. 短信配置 ====================
+    # ==================== 6. 短信配置 ====================
     'sms': {
         'title': 'SMS (Twilio)',
         'icon': 'phone',
-        'order': 8,
+        'order': 6,
         'items': [
             {
                 'key': 'TWILIO_ACCOUNT_SID',
@@ -524,223 +519,106 @@ CONFIG_SCHEMA = {
         ]
     },
 
-    # ==================== 9. AI Agent 配置 ====================
+    # ==================== 7. AI Agent ====================
     'agent': {
         'title': 'AI Agent',
         'icon': 'experiment',
-        'order': 9,
+        'order': 7,
         'items': [
-            {
-                'key': 'ENABLE_AGENT_MEMORY',
-                'label': 'Enable Agent Memory',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Enable AI agent memory for learning from past trades'
-            },
-            {
-                'key': 'AGENT_MEMORY_ENABLE_VECTOR',
-                'label': 'Enable Vector Search',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Enable local vector similarity search for memory retrieval'
-            },
-            {
-                'key': 'AGENT_MEMORY_EMBEDDING_DIM',
-                'label': 'Embedding Dimension',
-                'type': 'number',
-                'default': '256',
-                'description': 'Vector embedding dimension for memory storage'
-            },
-            {
-                'key': 'AGENT_MEMORY_TOP_K',
-                'label': 'Retrieval Top-K',
-                'type': 'number',
-                'default': '5',
-                'description': 'Number of similar memories to retrieve'
-            },
-            {
-                'key': 'AGENT_MEMORY_CANDIDATE_LIMIT',
-                'label': 'Candidate Limit',
-                'type': 'number',
-                'default': '500',
-                'description': 'Maximum candidates for similarity search'
-            },
-            {
-                'key': 'AGENT_MEMORY_HALF_LIFE_DAYS',
-                'label': 'Recency Half-life (days)',
-                'type': 'number',
-                'default': '30',
-                'description': 'Time decay half-life for memory recency scoring'
-            },
-            {
-                'key': 'AGENT_MEMORY_W_SIM',
-                'label': 'Similarity Weight',
-                'type': 'number',
-                'default': '0.75',
-                'description': 'Weight for similarity score in memory ranking (0-1)'
-            },
-            {
-                'key': 'AGENT_MEMORY_W_RECENCY',
-                'label': 'Recency Weight',
-                'type': 'number',
-                'default': '0.20',
-                'description': 'Weight for recency score in memory ranking (0-1)'
-            },
-            {
-                'key': 'AGENT_MEMORY_W_RETURNS',
-                'label': 'Returns Weight',
-                'type': 'number',
-                'default': '0.05',
-                'description': 'Weight for returns score in memory ranking (0-1)'
-            },
             {
                 'key': 'ENABLE_REFLECTION_WORKER',
                 'label': 'Enable Auto Reflection',
                 'type': 'boolean',
                 'default': 'False',
-                'description': 'Enable background worker for automatic trade reflection'
+                'description': 'Enable background worker for automatic trade reflection and calibration'
             },
             {
                 'key': 'REFLECTION_WORKER_INTERVAL_SEC',
                 'label': 'Reflection Interval (sec)',
                 'type': 'number',
                 'default': '86400',
-                'description': 'Interval between automatic reflection runs (default: 24h)'
+                'description': 'Reflection worker run interval in seconds (86400 = 1 day)'
+            },
+            {
+                'key': 'REFLECTION_MIN_AGE_DAYS',
+                'label': 'Min Age for Validation (days)',
+                'type': 'number',
+                'default': '7',
+                'description': 'Only validate analyses older than N days'
+            },
+            {
+                'key': 'REFLECTION_VALIDATE_LIMIT',
+                'label': 'Validation Batch Limit',
+                'type': 'number',
+                'default': '200',
+                'description': 'Max records to validate per reflection cycle'
+            },
+            {
+                'key': 'ENABLE_CONFIDENCE_CALIBRATION',
+                'label': 'Enable Confidence Calibration',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Adjust confidence by historical accuracy in each bucket'
+            },
+            {
+                'key': 'ENABLE_AI_ENSEMBLE',
+                'label': 'Enable Multi-Model Voting',
+                'type': 'boolean',
+                'default': 'False',
+                'description': 'Use 2-3 models and majority vote for more stable decisions'
+            },
+            {
+                'key': 'AI_ENSEMBLE_MODELS',
+                'label': 'Ensemble Models',
+                'type': 'text',
+                'default': 'openai/gpt-4o,openai/gpt-4o-mini',
+                'description': 'Comma-separated model IDs for ensemble voting'
+            },
+            {
+                'key': 'AI_CALIBRATION_MARKETS',
+                'label': 'Calibration Markets',
+                'type': 'text',
+                'default': 'Crypto',
+                'description': 'Comma-separated markets to run threshold calibration'
+            },
+            {
+                'key': 'AI_CALIBRATION_LOOKBACK_DAYS',
+                'label': 'Calibration Lookback (days)',
+                'type': 'number',
+                'default': '30',
+                'description': 'Days of validated data for calibration'
+            },
+            {
+                'key': 'AI_CALIBRATION_MIN_SAMPLES',
+                'label': 'Calibration Min Samples',
+                'type': 'number',
+                'default': '80',
+                'description': 'Minimum validated samples required for calibration'
             },
         ]
     },
 
-    # ==================== 10. 网络代理 ====================
+    # ==================== 8. 网络代理 ====================
     'network': {
         'title': 'Network & Proxy',
         'icon': 'global',
-        'order': 10,
+        'order': 8,
         'items': [
-            {
-                'key': 'PROXY_HOST',
-                'label': 'Proxy Host',
-                'type': 'text',
-                'default': '127.0.0.1',
-                'description': 'Proxy server hostname or IP'
-            },
-            {
-                'key': 'PROXY_PORT',
-                'label': 'Proxy Port',
-                'type': 'text',
-                'required': False,
-                'description': 'Proxy server port (leave empty to disable proxy)'
-            },
-            {
-                'key': 'PROXY_SCHEME',
-                'label': 'Proxy Protocol',
-                'type': 'select',
-                'options': ['socks5h', 'socks5', 'http', 'https'],
-                'default': 'socks5h',
-                'description': 'Proxy protocol type. socks5h: SOCKS5 with DNS resolution'
-            },
             {
                 'key': 'PROXY_URL',
-                'label': 'Full Proxy URL',
+                'label': 'Proxy URL',
                 'type': 'text',
                 'required': False,
-                'description': 'Complete proxy URL (overrides above settings if set)'
+                'description': 'Global outbound proxy URL. Used by requests and by crypto data requests when a proxy is needed.'
             },
         ]
     },
 
-    # ==================== 11. 搜索配置 ====================
-    'search': {
-        'title': 'Web Search',
-        'icon': 'search',
-        'order': 11,
-        'items': [
-            {
-                'key': 'SEARCH_PROVIDER',
-                'label': 'Search Provider',
-                'type': 'select',
-                'options': ['bocha', 'tavily', 'google', 'bing', 'none'],
-                'default': 'bocha',
-                'description': 'Web search provider for AI research features. Bocha recommended for A-share news'
-            },
-            {
-                'key': 'SEARCH_MAX_RESULTS',
-                'label': 'Max Results',
-                'type': 'number',
-                'default': '10',
-                'description': 'Maximum search results to return'
-            },
-            # Tavily Search API
-            {
-                'key': 'TAVILY_API_KEYS',
-                'label': 'Tavily API Keys',
-                'type': 'password',
-                'required': False,
-                'link': 'https://tavily.com/',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'Tavily Search API keys, comma-separated for rotation. Free 1000 requests/month'
-            },
-            # Bocha Search API
-            {
-                'key': 'BOCHA_API_KEYS',
-                'label': 'Bocha API Keys',
-                'type': 'password',
-                'required': False,
-                'link': 'https://bochaai.com/',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'Bocha Search API keys, comma-separated for rotation. Best for A-share news'
-            },
-            # SerpAPI
-            {
-                'key': 'SERPAPI_KEYS',
-                'label': 'SerpAPI Keys',
-                'type': 'password',
-                'required': False,
-                'link': 'https://serpapi.com/',
-                'link_text': 'settings.link.getApiKey',
-                'description': 'SerpAPI keys for Google/Bing search, comma-separated for rotation'
-            },
-            {
-                'key': 'SEARCH_GOOGLE_API_KEY',
-                'label': 'Google API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://developers.google.com/custom-search/v1/introduction',
-                'link_text': 'settings.link.applyApi',
-                'description': 'Google Custom Search JSON API key'
-            },
-            {
-                'key': 'SEARCH_GOOGLE_CX',
-                'label': 'Google Search Engine ID',
-                'type': 'text',
-                'required': False,
-                'link': 'https://programmablesearchengine.google.com/controlpanel/all',
-                'link_text': 'settings.link.createSearchEngine',
-                'description': 'Google Programmable Search Engine ID (CX)'
-            },
-            {
-                'key': 'SEARCH_BING_API_KEY',
-                'label': 'Bing API Key',
-                'type': 'password',
-                'required': False,
-                'link': 'https://www.microsoft.com/en-us/bing/apis/bing-web-search-api',
-                'link_text': 'settings.link.applyApi',
-                'description': 'Microsoft Bing Web Search API key'
-            },
-            {
-                'key': 'INTERNAL_API_KEY',
-                'label': 'Internal API Key',
-                'type': 'password',
-                'required': False,
-                'description': 'Internal API authentication key for service-to-service calls'
-            },
-        ]
-    },
-
-    # ==================== 12. 注册与安全 ====================
+    # ==================== 10. 注册与 OAuth ====================
     'security': {
-        'title': 'Registration & Security',
+        'title': 'Registration & OAuth',
         'icon': 'safety',
-        'order': 12,
+        'order': 10,
         'items': [
             {
                 'key': 'ENABLE_REGISTRATION',
@@ -750,13 +628,20 @@ CONFIG_SCHEMA = {
                 'description': 'Allow new users to register accounts'
             },
             {
+                'key': 'FRONTEND_URL',
+                'label': 'Frontend URL',
+                'type': 'text',
+                'default': 'http://localhost:8080',
+                'description': 'Frontend URL for OAuth redirects'
+            },
+            {
                 'key': 'TURNSTILE_SITE_KEY',
                 'label': 'Turnstile Site Key',
                 'type': 'text',
                 'required': False,
                 'link': 'https://dash.cloudflare.com/?to=/:account/turnstile',
                 'link_text': 'settings.link.getTurnstileKey',
-                'description': 'Cloudflare Turnstile site key for CAPTCHA verification'
+                'description': 'Cloudflare Turnstile site key for CAPTCHA'
             },
             {
                 'key': 'TURNSTILE_SECRET_KEY',
@@ -766,192 +651,169 @@ CONFIG_SCHEMA = {
                 'description': 'Cloudflare Turnstile secret key'
             },
             {
-                'key': 'FRONTEND_URL',
-                'label': 'Frontend URL',
-                'type': 'text',
-                'default': 'http://localhost:8080',
-                'description': 'Frontend URL for OAuth redirects'
-            },
-            {
                 'key': 'GOOGLE_CLIENT_ID',
-                'label': 'Google Client ID',
+                'label': 'Google OAuth Client ID',
                 'type': 'text',
                 'required': False,
                 'link': 'https://console.cloud.google.com/apis/credentials',
                 'link_text': 'settings.link.getGoogleCredentials',
-                'description': 'Google OAuth Client ID'
+                'description': 'Google OAuth Client ID for Google login'
             },
             {
                 'key': 'GOOGLE_CLIENT_SECRET',
-                'label': 'Google Client Secret',
+                'label': 'Google OAuth Secret',
                 'type': 'password',
                 'required': False,
                 'description': 'Google OAuth Client Secret'
             },
             {
-                'key': 'GOOGLE_REDIRECT_URI',
-                'label': 'Google Redirect URI',
-                'type': 'text',
-                'default': 'http://localhost:5000/api/auth/oauth/google/callback',
-                'description': 'Google OAuth callback URL'
-            },
-            {
                 'key': 'GITHUB_CLIENT_ID',
-                'label': 'GitHub Client ID',
+                'label': 'GitHub OAuth Client ID',
                 'type': 'text',
                 'required': False,
                 'link': 'https://github.com/settings/developers',
                 'link_text': 'settings.link.getGithubCredentials',
-                'description': 'GitHub OAuth Client ID'
+                'description': 'GitHub OAuth Client ID for GitHub login'
             },
             {
                 'key': 'GITHUB_CLIENT_SECRET',
-                'label': 'GitHub Client Secret',
+                'label': 'GitHub OAuth Secret',
                 'type': 'password',
                 'required': False,
                 'description': 'GitHub OAuth Client Secret'
             },
-            {
-                'key': 'GITHUB_REDIRECT_URI',
-                'label': 'GitHub Redirect URI',
-                'type': 'text',
-                'default': 'http://localhost:5000/api/auth/oauth/github/callback',
-                'description': 'GitHub OAuth callback URL'
-            },
-            {
-                'key': 'SECURITY_IP_MAX_ATTEMPTS',
-                'label': 'IP Max Failed Attempts',
-                'type': 'number',
-                'default': '10',
-                'description': 'Block IP after this many failed login attempts'
-            },
-            {
-                'key': 'SECURITY_IP_WINDOW_MINUTES',
-                'label': 'IP Window (minutes)',
-                'type': 'number',
-                'default': '5',
-                'description': 'Time window for counting IP failed attempts'
-            },
-            {
-                'key': 'SECURITY_IP_BLOCK_MINUTES',
-                'label': 'IP Block Duration (minutes)',
-                'type': 'number',
-                'default': '15',
-                'description': 'How long to block IP after exceeding limit'
-            },
-            {
-                'key': 'SECURITY_ACCOUNT_MAX_ATTEMPTS',
-                'label': 'Account Max Failed Attempts',
-                'type': 'number',
-                'default': '5',
-                'description': 'Lock account after this many failed login attempts'
-            },
-            {
-                'key': 'SECURITY_ACCOUNT_WINDOW_MINUTES',
-                'label': 'Account Window (minutes)',
-                'type': 'number',
-                'default': '60',
-                'description': 'Time window for counting account failed attempts'
-            },
-            {
-                'key': 'SECURITY_ACCOUNT_BLOCK_MINUTES',
-                'label': 'Account Block Duration (minutes)',
-                'type': 'number',
-                'default': '30',
-                'description': 'How long to lock account after exceeding limit'
-            },
-            {
-                'key': 'VERIFICATION_CODE_EXPIRE_MINUTES',
-                'label': 'Verification Code Expiry (minutes)',
-                'type': 'number',
-                'default': '10',
-                'description': 'Email verification code validity period'
-            },
-            {
-                'key': 'VERIFICATION_CODE_RATE_LIMIT',
-                'label': 'Code Rate Limit (seconds)',
-                'type': 'number',
-                'default': '60',
-                'description': 'Minimum time between verification code requests per email'
-            },
-            {
-                'key': 'VERIFICATION_CODE_IP_HOURLY_LIMIT',
-                'label': 'Code Hourly Limit per IP',
-                'type': 'number',
-                'default': '10',
-                'description': 'Maximum verification codes per IP per hour'
-            },
-            {
-                'key': 'VERIFICATION_CODE_MAX_ATTEMPTS',
-                'label': 'Code Max Attempts',
-                'type': 'number',
-                'default': '5',
-                'description': 'Maximum attempts to verify a code before lockout'
-            },
-            {
-                'key': 'VERIFICATION_CODE_LOCK_MINUTES',
-                'label': 'Code Lock Minutes',
-                'type': 'number',
-                'default': '30',
-                'description': 'Lockout duration after exceeding max attempts'
-            },
         ]
     },
 
-    # ==================== 13. 计费配置 ====================
+    # ==================== 11. 计费配置 ====================
     'billing': {
         'title': 'Billing & Credits',
         'icon': 'dollar',
-        'order': 13,
+        'order': 11,
         'items': [
             {
                 'key': 'BILLING_ENABLED',
                 'label': 'Enable Billing',
                 'type': 'boolean',
                 'default': 'False',
-                'description': 'Enable billing system. When enabled, users need credits to use certain features'
+                'description': 'Enable billing system. Users need credits to use certain features'
+            },
+
+            # ===== Membership Plans (3 tiers) =====
+            {
+                'key': 'MEMBERSHIP_MONTHLY_PRICE_USD',
+                'label': 'Monthly Membership Price (USD)',
+                'type': 'number',
+                'default': '19.9',
+                'description': 'Monthly membership price in USD (mock payment in current version)'
             },
             {
-                'key': 'BILLING_VIP_BYPASS',
-                'label': 'VIP Free',
+                'key': 'MEMBERSHIP_MONTHLY_CREDITS',
+                'label': 'Monthly Membership Bonus Credits',
+                'type': 'number',
+                'default': '500',
+                'description': 'Credits granted immediately after purchasing monthly membership'
+            },
+            {
+                'key': 'MEMBERSHIP_YEARLY_PRICE_USD',
+                'label': 'Yearly Membership Price (USD)',
+                'type': 'number',
+                'default': '199',
+                'description': 'Yearly membership price in USD (mock payment in current version)'
+            },
+            {
+                'key': 'MEMBERSHIP_YEARLY_CREDITS',
+                'label': 'Yearly Membership Bonus Credits',
+                'type': 'number',
+                'default': '8000',
+                'description': 'Credits granted immediately after purchasing yearly membership'
+            },
+            {
+                'key': 'MEMBERSHIP_LIFETIME_PRICE_USD',
+                'label': 'Lifetime Membership Price (USD)',
+                'type': 'number',
+                'default': '499',
+                'description': 'Lifetime membership price in USD (mock payment in current version)'
+            },
+            {
+                'key': 'MEMBERSHIP_LIFETIME_MONTHLY_CREDITS',
+                'label': 'Lifetime Membership Monthly Credits',
+                'type': 'number',
+                'default': '800',
+                'description': 'Credits granted every 30 days for lifetime members'
+            },
+
+            # ===== USDT Pay (方案B：每单独立地址) =====
+            {
+                'key': 'USDT_PAY_ENABLED',
+                'label': 'Enable USDT Pay',
                 'type': 'boolean',
-                'default': 'True',
-                'description': 'VIP users can use all paid features for free during VIP period'
+                'default': 'False',
+                'description': 'Enable USDT scan-to-pay flow (per-order unique address)'
+            },
+            {
+                'key': 'USDT_PAY_CHAIN',
+                'label': 'USDT Chain',
+                'type': 'select',
+                'default': 'TRC20',
+                'options': ['TRC20'],
+                'description': 'Currently only TRC20 is supported'
+            },
+            {
+                'key': 'USDT_TRC20_XPUB',
+                'label': 'TRC20 XPUB (Watch-only)',
+                'type': 'password',
+                'required': False,
+                'description': 'Watch-only xpub used to derive per-order deposit addresses. Do NOT paste private key.'
+            },
+            {
+                'key': 'USDT_TRC20_CONTRACT',
+                'label': 'USDT TRC20 Contract',
+                'type': 'text',
+                'default': 'TXLAQ63Xg1NAzckPwKHvzw7CSEmLMEqcdj',
+                'description': 'USDT contract address on TRON'
+            },
+            {
+                'key': 'TRONGRID_BASE_URL',
+                'label': 'TronGrid Base URL',
+                'type': 'text',
+                'default': 'https://api.trongrid.io',
+                'description': 'TronGrid API base URL'
+            },
+            {
+                'key': 'TRONGRID_API_KEY',
+                'label': 'TronGrid API Key',
+                'type': 'password',
+                'required': False,
+                'description': 'Optional TronGrid API key for higher rate limits'
+            },
+            {
+                'key': 'USDT_PAY_CONFIRM_SECONDS',
+                'label': 'Confirm Delay (sec)',
+                'type': 'number',
+                'default': '30',
+                'description': 'Delay before marking a paid transaction as confirmed (TRC20)'
+            },
+            {
+                'key': 'USDT_PAY_EXPIRE_MINUTES',
+                'label': 'Order Expire (min)',
+                'type': 'number',
+                'default': '30',
+                'description': 'USDT payment order expiration time in minutes'
             },
             {
                 'key': 'BILLING_COST_AI_ANALYSIS',
-                'label': 'AI Analysis Cost',
+                'label': 'AI Analysis Cost (per symbol)',
                 'type': 'number',
                 'default': '10',
-                'description': 'Credits consumed per AI analysis request'
+                'description': 'Credits per symbol (instant analysis, AI filter, scheduled tasks all use this price)'
             },
             {
-                'key': 'BILLING_COST_STRATEGY_RUN',
-                'label': 'Strategy Run Cost',
+                'key': 'BILLING_COST_AI_CODE_GEN',
+                'label': 'AI Code Generation Cost',
                 'type': 'number',
-                'default': '5',
-                'description': 'Credits consumed when starting a strategy'
-            },
-            {
-                'key': 'BILLING_COST_BACKTEST',
-                'label': 'Backtest Cost',
-                'type': 'number',
-                'default': '3',
-                'description': 'Credits consumed per backtest run'
-            },
-            {
-                'key': 'BILLING_COST_PORTFOLIO_MONITOR',
-                'label': 'Portfolio Monitor Cost',
-                'type': 'number',
-                'default': '8',
-                'description': 'Credits consumed per portfolio AI monitoring run'
-            },
-            {
-                'key': 'RECHARGE_TELEGRAM_URL',
-                'label': 'Recharge Telegram URL',
-                'type': 'text',
-                'default': 'https://t.me/your_support_bot',
-                'description': 'Telegram customer service URL for recharge inquiries'
+                'default': '30',
+                'description': 'Credits per AI strategy/indicator code generation (higher token usage)'
             },
             {
                 'key': 'CREDITS_REGISTER_BONUS',
@@ -965,54 +827,11 @@ CONFIG_SCHEMA = {
                 'label': 'Referral Bonus',
                 'type': 'number',
                 'default': '50',
-                'description': 'Credits awarded to referrer when someone signs up with their code'
+                'description': 'Credits awarded to referrer for each signup'
             },
         ]
     },
 
-    # ==================== 14. 应用配置 ====================
-    'app': {
-        'title': 'Application',
-        'icon': 'appstore',
-        'order': 14,
-        'items': [
-            {
-                'key': 'CORS_ORIGINS',
-                'label': 'CORS Origins',
-                'type': 'text',
-                'default': '*',
-                'description': 'Allowed CORS origins (* for all, or comma-separated list)'
-            },
-            {
-                'key': 'RATE_LIMIT',
-                'label': 'Rate Limit (req/min)',
-                'type': 'number',
-                'default': '100',
-                'description': 'API rate limit per IP per minute'
-            },
-            {
-                'key': 'ENABLE_CACHE',
-                'label': 'Enable Cache',
-                'type': 'boolean',
-                'default': 'False',
-                'description': 'Enable response caching for improved performance'
-            },
-            {
-                'key': 'ENABLE_REQUEST_LOG',
-                'label': 'Enable Request Log',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Log all API requests for debugging'
-            },
-            {
-                'key': 'ENABLE_AI_ANALYSIS',
-                'label': 'Enable AI Analysis',
-                'type': 'boolean',
-                'default': 'True',
-                'description': 'Enable AI-powered market analysis features'
-            },
-        ]
-    },
 }
 
 
@@ -1118,6 +937,19 @@ def get_settings_schema():
     })
 
 
+@settings_bp.route('/public-config', methods=['GET'])
+@login_required
+def get_public_config():
+    """Return non-sensitive config values needed by frontend widgets."""
+    from app.config.data_sources import CCXTConfig
+    return jsonify({
+        'code': 1,
+        'data': {
+            'ccxt_default_exchange': (CCXTConfig.DEFAULT_EXCHANGE or 'binance').lower(),
+        }
+    })
+
+
 @settings_bp.route('/values', methods=['GET'])
 @login_required
 @admin_required
@@ -1182,13 +1014,19 @@ def save_settings():
         if write_env_file(current_env):
             # 清除配置缓存
             clear_config_cache()
+            # 热重载运行时环境变量（无需重启进程）
+            _reload_runtime_env()
+            # 重置依赖配置的服务单例（下次请求自动按新配置重建）
+            _refresh_runtime_services()
             
             return jsonify({
                 'code': 1,
                 'msg': 'Settings saved successfully',
                 'data': {
                     'updated_keys': list(updates.keys()),
-                    'requires_restart': True  # 标记需要重启
+                    'requires_restart': False,
+                    'hot_reloaded': True,
+                    'services_refreshed': True
                 }
             })
         else:

@@ -4,31 +4,38 @@ Binance Spot (direct REST) client.
 
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_binance_futures_symbol
 
 
 class BinanceSpotClient(BaseRestClient):
-    def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0):
+    def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0, broker_id: str = ""):
         if not base_url:
             base_url = "https://demo-api.binance.com" if enable_demo_trading else "https://api.binance.com"
 
         super().__init__(base_url=base_url, timeout_sec=timeout_sec)
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
+        self.broker_id = (broker_id or "").strip()
         if not self.api_key or not self.secret_key:
             raise LiveTradingError("Missing Binance api_key/secret_key")
 
         # Best-effort cache for public symbol filters used to normalize quantities.
         self._sym_filter_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._sym_filter_cache_ttl_sec = 300.0
+
+        self._time_offset_ms: int = 0
+        self._time_sync_monotonic: float = 0.0
 
     @staticmethod
     def _to_dec(x: Any) -> Decimal:
@@ -157,17 +164,68 @@ class BinanceSpotClient(BaseRestClient):
     def _signed_headers(self) -> Dict[str, str]:
         return {"X-MBX-APIKEY": self.api_key}
 
+    def _ensure_server_time(self, *, force: bool = False) -> None:
+        """Align signed request timestamps with Binance (GET /api/v3/time)."""
+        now_m = time.monotonic()
+        if not force and (now_m - float(self._time_sync_monotonic or 0.0)) < 300.0:
+            return
+        try:
+            code, data, _ = self._request("GET", "/api/v3/time")
+            if code != 200 or not isinstance(data, dict):
+                return
+            server_ms = int(data.get("serverTime") or 0)
+            if server_ms <= 0:
+                return
+            local_ms = int(time.time() * 1000)
+            self._time_offset_ms = server_ms - local_ms
+            self._time_sync_monotonic = now_m
+        except Exception:
+            pass
+
+    def _format_client_order_id(self, client_order_id: Optional[str]) -> str:
+        raw = str(client_order_id or "").strip()
+        broker_id = str(self.broker_id or "").strip()
+        if not raw:
+            return ""
+        if not broker_id:
+            return raw[:36]
+        prefix = f"x-{broker_id}"
+        if raw.startswith(prefix):
+            return raw[:36]
+        suffix_budget = max(0, 36 - len(prefix))
+        if suffix_budget <= 0:
+            return prefix[:36]
+        return f"{prefix}{raw[:suffix_budget]}"
+
     def _signed_request(self, method: str, path: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
-        p = dict(params or {})
-        p["timestamp"] = int(time.time() * 1000)
-        qs = urlencode(p, doseq=True)
-        p["signature"] = self._sign(qs)
-        code, data, text = self._request(method, path, params=p, headers=self._signed_headers())
-        if code >= 400:
-            raise LiveTradingError(f"BinanceSpot HTTP {code}: {text[:500]}")
-        if isinstance(data, dict) and data.get("code") and int(data.get("code")) < 0:
-            raise LiveTradingError(f"BinanceSpot error: {data}")
-        return data if isinstance(data, dict) else {"raw": data}
+        self._ensure_server_time()
+        last_err: Optional[LiveTradingError] = None
+        for attempt in range(2):
+            p = dict(params or {})
+            p["timestamp"] = int(time.time() * 1000) + int(self._time_offset_ms)
+            if "recvWindow" not in p:
+                p["recvWindow"] = 10000
+            qs = urlencode(p, doseq=True)
+            p["signature"] = self._sign(qs)
+            code, data, text = self._request(method, path, params=p, headers=self._signed_headers())
+            if code >= 400:
+                err = LiveTradingError(f"BinanceSpot HTTP {code}: {text[:500]}")
+                if attempt == 0 and ("-1021" in text or "1021" in text):
+                    self._ensure_server_time(force=True)
+                    last_err = err
+                    continue
+                raise err
+            if isinstance(data, dict) and data.get("code") and int(data.get("code")) < 0:
+                err = LiveTradingError(f"BinanceSpot error: {data}")
+                if attempt == 0 and int(data.get("code") or 0) == -1021:
+                    self._ensure_server_time(force=True)
+                    last_err = err
+                    continue
+                raise err
+            return data if isinstance(data, dict) else {"raw": data}
+        if last_err:
+            raise last_err
+        raise LiveTradingError("BinanceSpot signed request failed")
 
     def ping(self) -> bool:
         """
@@ -382,8 +440,9 @@ class BinanceSpotClient(BaseRestClient):
             "quantity": self._dec_str(q_dec, strict_precision=qty_precision),
             "price": self._dec_str(px_dec),
         }
-        if client_order_id:
-            params["newClientOrderId"] = str(client_order_id)
+        client_order_id_norm = self._format_client_order_id(client_order_id)
+        if client_order_id_norm:
+            params["newClientOrderId"] = client_order_id_norm
         try:
             raw = self._signed_request("POST", "/api/v3/order", params=params)
         except LiveTradingError as e:
@@ -423,8 +482,9 @@ class BinanceSpotClient(BaseRestClient):
             "type": "MARKET",
             "quantity": self._dec_str(q_dec, strict_precision=qty_precision),
         }
-        if client_order_id:
-            params["newClientOrderId"] = str(client_order_id)
+        client_order_id_norm = self._format_client_order_id(client_order_id)
+        if client_order_id_norm:
+            params["newClientOrderId"] = client_order_id_norm
         try:
             raw = self._signed_request("POST", "/api/v3/order", params=params)
         except LiveTradingError as e:
@@ -469,33 +529,52 @@ class BinanceSpotClient(BaseRestClient):
         data = self._signed_request("GET", "/api/v3/myTrades", params=params)
         return data
 
-    def get_fee_for_order(self, *, symbol: str, order_id: str) -> Tuple[float, str]:
+    def get_fee_for_order(self, *, symbol: str, order_id: str, max_retries: int = 3) -> Tuple[float, str]:
         """
         Best-effort: sum commissions from fills for a specific spot order.
+        Retries a few times because myTrades may lag behind order fill.
 
         Returns: (total_fee, fee_ccy)
         """
-        try:
-            trades = self.get_my_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
-        except Exception:
-            trades = []
-        if not isinstance(trades, list):
-            return 0.0, ""
-        total_fee = 0.0
-        fee_ccy = ""
-        for t in trades:
-            if not isinstance(t, dict):
-                continue
+        for attempt in range(max(1, max_retries)):
             try:
-                fee = float(t.get("commission") or 0.0)
+                trades = self.get_my_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
             except Exception:
-                fee = 0.0
-            ccy = str(t.get("commissionAsset") or "").strip()
-            if fee != 0.0:
-                total_fee += abs(float(fee))
-                if (not fee_ccy) and ccy:
-                    fee_ccy = ccy
-        return float(total_fee), str(fee_ccy or "")
+                trades = []
+            if not isinstance(trades, list):
+                trades = []
+            total_fee = 0.0
+            fee_ccy = ""
+            for t in trades:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    fee = float(t.get("commission") or 0.0)
+                except Exception:
+                    fee = 0.0
+                ccy = str(t.get("commissionAsset") or "").strip()
+                if fee != 0.0:
+                    total_fee += abs(float(fee))
+                    if (not fee_ccy) and ccy:
+                        fee_ccy = ccy
+            if total_fee > 0 or attempt >= max_retries - 1:
+                return float(total_fee), str(fee_ccy or "")
+            time.sleep(1.0)
+        return 0.0, ""
+
+    def get_fee_rate(self, symbol: str, market_type: str = "spot") -> Optional[Dict[str, float]]:
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        try:
+            data = self._signed_request("GET", "/sapi/v1/asset/tradeFee", params={"symbol": sym})
+            if isinstance(data, list) and data and isinstance(data[0], dict):
+                rec = data[0]
+                maker = abs(float(rec.get("makerCommission") or 0))
+                taker = abs(float(rec.get("takerCommission") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"BinanceSpot get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def cancel_order(self, *, symbol: str, order_id: str = "", client_order_id: str = "") -> Dict[str, Any]:
         sym = to_binance_futures_symbol(symbol)
@@ -550,11 +629,67 @@ class BinanceSpotClient(BaseRestClient):
                 pass
 
             if filled > 0 and avg_price > 0:
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if status in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = 0.0, ""
+                if filled > 0:
+                    fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if time.time() >= end_ts:
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = 0.0, ""
+                if filled > 0:
+                    fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
+
+    def _fetch_commission_for_order(self, *, symbol: str, order_id: str, filled: float, avg_price: float) -> Tuple[float, str]:
+        """Fetch real commission from myTrades; fall back to tradeFee rate calculation."""
+        oid = str(order_id or "").strip()
+        # Method 1: myTrades (up to 3 attempts with 1.5s delay)
+        for attempt in range(3):
+            try:
+                trades = self.get_my_trades(symbol=symbol, order_id=oid, limit=200) if oid else []
+                if not isinstance(trades, list):
+                    trades = []
+                total_fee = 0.0
+                fee_ccy = ""
+                for t in trades:
+                    if not isinstance(t, dict):
+                        continue
+                    try:
+                        c = float(t.get("commission") or 0.0)
+                    except (ValueError, TypeError):
+                        c = 0.0
+                    ccy = str(t.get("commissionAsset") or "").strip()
+                    if c != 0.0:
+                        total_fee += abs(c)
+                        if not fee_ccy and ccy:
+                            fee_ccy = ccy
+                if total_fee > 0:
+                    logger.debug("BinanceSpot fee via myTrades: %.8f %s (order=%s)", total_fee, fee_ccy, oid)
+                    return total_fee, fee_ccy
+                if attempt < 2:
+                    time.sleep(1.5)
+            except Exception as e:
+                logger.warning("BinanceSpot myTrades fee query failed (attempt=%d): %s", attempt, e)
+                if attempt < 2:
+                    time.sleep(1.0)
+
+        # Method 2: calculate from tradeFee rate
+        if filled > 0 and avg_price > 0:
+            try:
+                rate_info = self.get_fee_rate(symbol=symbol)
+                if rate_info:
+                    taker_rate = float(rate_info.get("taker") or 0.0)
+                    if taker_rate > 0:
+                        calc_fee = filled * avg_price * taker_rate
+                        logger.info("BinanceSpot fee via tradeFee rate: %.8f USDT (rate=%.6f, order=%s)", calc_fee, taker_rate, oid)
+                        return calc_fee, "USDT"
+            except Exception as e:
+                logger.warning("BinanceSpot tradeFee rate fallback failed: %s", e)
+
+        logger.warning("BinanceSpot could not obtain fee for order=%s symbol=%s", oid, symbol)
+        return 0.0, ""
 
 

@@ -32,13 +32,14 @@ class USStockDataSource(BaseDataSource):
     }
     
     # 不同周期获取数据的天数范围
+    # 美股每日约6.5交易小时，交易日/日历日 ≈ 5/7；乘1.5留余量
     DAYS_MAP = {
         '1m': lambda limit: min(7, max(1, (limit // 390) + 2)),
         '5m': lambda limit: min(60, max(1, (limit // 78) + 2)),
-        '15m': lambda limit: min(60, max(1, (limit // 26) + 2)),
-        '30m': lambda limit: min(60, max(1, (limit // 13) + 2)),
-        '1H': lambda limit: min(730, max(1, (limit // 24) + 2)),
-        '4H': lambda limit: min(730, max(1, (limit // 6) + 2)),
+        '15m': lambda limit: min(60, max(2, (limit // 26) + 3)),
+        '30m': lambda limit: min(60, max(2, (limit // 13) + 3)),
+        '1H': lambda limit: min(730, max(5, int(limit / 6.5 * 7 / 5 * 1.5) + 5)),
+        '4H': lambda limit: min(730, max(10, int(limit / 1.625 * 7 / 5 * 1.5) + 5)),
         '1D': lambda limit: min(3650, limit + 1),
         '1W': lambda limit: min(3650, (limit * 7) + 7)
     }
@@ -88,7 +89,11 @@ class USStockDataSource(BaseDataSource):
                         'previousClose': quote.get('pc', 0)  # 昨收价
                     }
             except Exception as e:
-                logger.warning(f"Finnhub quote failed for {symbol}: {e}")
+                msg = str(e).lower()
+                if "403" in str(e) or "don't have access" in msg or "no access" in msg:
+                    logger.debug(f"Finnhub quote skipped (no access): {symbol}: {e}")
+                else:
+                    logger.warning(f"Finnhub quote failed for {symbol}: {e}")
         
         # 降级使用 yfinance
         try:
@@ -260,7 +265,12 @@ class USStockDataSource(BaseDataSource):
                     ))
                 # logger.info(f"Finnhub 返回 {len(klines)} 条数据")
         except Exception as e:
-            logger.error(f"Finnhub fetch failed: {e}")
+            msg = str(e).lower()
+            # Free tier / plan: 403 "You don't have access to this resource" is common; avoid ERROR spam.
+            if "403" in str(e) or "don't have access" in msg or "no access" in msg:
+                logger.debug(f"Finnhub candles skipped (no access): {symbol}: {e}")
+            else:
+                logger.warning(f"Finnhub fetch failed: {e}")
         
         return klines
     

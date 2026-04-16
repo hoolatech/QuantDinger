@@ -34,6 +34,29 @@ os.environ.setdefault("TQDM_DISABLE", "1")
 
 # Optional: normalize outbound proxy settings for the whole process.
 # This makes requests/yfinance/finnhub/tiingo/GoogleSearch etc work behind a local proxy.
+#
+# Chinese domestic data sources (AkShare → Eastmoney/Sina/etc.) should bypass the proxy
+# to avoid unnecessary round-trips through overseas proxies.
+_CN_FINANCIAL_DOMAINS = ",".join([
+    ".eastmoney.com",
+    ".sina.com.cn",
+    ".sinajs.cn",
+    ".10jqka.com.cn",
+    ".ssec.com.cn",
+    ".szse.cn",
+    ".hexun.com",
+    ".cninfo.com.cn",
+    ".gtimg.cn",
+    ".qq.com",
+    ".tencent.com",
+    ".mairui.club",
+    ".akshare.xyz",
+    ".baostock.com",
+    ".stcn.com",
+    ".p5w.net",
+    ".finance.sina.com.cn",
+])
+
 def _apply_proxy_env():
     def _set_if_blank(key: str, value: str) -> None:
         """
@@ -47,14 +70,6 @@ def _apply_proxy_env():
     # If user provided explicit proxy URL, honor it.
     proxy_url = (os.getenv('PROXY_URL') or '').strip()
 
-    # If user only provided port, build a URL (common local proxy setups).
-    if not proxy_url:
-        port = (os.getenv('PROXY_PORT') or '').strip()
-        if port:
-            host = (os.getenv('PROXY_HOST') or '127.0.0.1').strip()
-            scheme = (os.getenv('PROXY_SCHEME') or 'socks5h').strip()
-            proxy_url = f"{scheme}://{host}:{port}"
-
     if not proxy_url:
         return
 
@@ -63,8 +78,15 @@ def _apply_proxy_env():
     _set_if_blank('HTTP_PROXY', proxy_url)
     _set_if_blank('HTTPS_PROXY', proxy_url)
 
-    # CCXT config uses CCXT_PROXY in our codebase.
-    _set_if_blank('CCXT_PROXY', proxy_url)
+    # Bypass proxy for Chinese domestic financial data sources.
+    # AkShare calls Eastmoney/Sina/etc. which should go direct, not through overseas proxy.
+    existing_no_proxy = (os.getenv('NO_PROXY') or '').strip()
+    if existing_no_proxy:
+        merged = existing_no_proxy + "," + _CN_FINANCIAL_DOMAINS
+    else:
+        merged = _CN_FINANCIAL_DOMAINS
+    os.environ['NO_PROXY'] = merged
+    os.environ['no_proxy'] = merged
 
 _apply_proxy_env()
 
@@ -82,16 +104,20 @@ app = create_app()
 def main():
     """启动应用"""
     # Keep startup messages ASCII-only and short.
-    print("QuantDinger Python API v2.0.0")
+    print("QuantDinger Python API v2.2.2")
     
-    # Check demo mode status for debugging
-    demo_status = os.getenv('IS_DEMO_MODE', 'false').lower()
-    print(f"Status Check: IS_DEMO_MODE={demo_status}")
-    if demo_status == 'true':
-        print("!!! RUNNING IN DEMO MODE (READ-ONLY) !!!")
-    else:
-        print("Running in FULL ACCESS mode")
-        
+    # ========== Critical Security Check for SECRET_KEY ==========
+    # In production (DEBUG=False), the SECRET_KEY MUST NOT use the default example value.
+    # This prevents attackers from forging JWT tokens with admin privileges.
+    default_secret = "quantdinger-secret-key-change-me"
+    current_secret = Config.SECRET_KEY
+    if not Config.DEBUG and current_secret == default_secret:
+        import secrets as _secrets
+        new_key = _secrets.token_hex(32)
+        os.environ["SECRET_KEY"] = new_key
+        print("[AUTO] SECRET_KEY was default; generated random key for this session.")
+        print("[TIP]  Set a persistent SECRET_KEY in backend_api_python/.env for production.")
+    
     print(f"Service starting at: http://{Config.HOST}:{Config.PORT}")
     
     # Flask dev server is for local development only.

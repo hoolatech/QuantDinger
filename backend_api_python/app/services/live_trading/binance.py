@@ -7,25 +7,29 @@ API docs (reference):
 
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_binance_futures_symbol
 
 
 class BinanceFuturesClient(BaseRestClient):
-    def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0):
+    def __init__(self, *, api_key: str, secret_key: str, base_url: str = None, enable_demo_trading: bool = False, timeout_sec: float = 15.0, broker_id: str = ""):
         if not base_url:
             base_url = "https://demo-fapi.binance.com" if enable_demo_trading else "https://fapi.binance.com"
 
         super().__init__(base_url=base_url, timeout_sec=timeout_sec)
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
+        self.broker_id = (broker_id or "").strip()
         if not self.api_key or not self.secret_key:
             raise LiveTradingError("Missing Binance api_key/secret_key")
 
@@ -38,6 +42,10 @@ class BinanceFuturesClient(BaseRestClient):
         # Binance endpoint: GET /fapi/v1/positionSide/dual -> {"dualSidePosition": true/false}
         self._dual_side_cache: Optional[Tuple[float, bool]] = None
         self._dual_side_cache_ttl_sec = 60.0
+
+        # serverTime - local_ms; avoids Binance -1021 when the host clock is ahead of Binance.
+        self._time_offset_ms: int = 0
+        self._time_sync_monotonic: float = 0.0
 
     @staticmethod
     def _to_dec(x: Any) -> Decimal:
@@ -162,18 +170,70 @@ class BinanceFuturesClient(BaseRestClient):
     def _signed_headers(self) -> Dict[str, str]:
         return {"X-MBX-APIKEY": self.api_key}
 
+    def _ensure_server_time(self, *, force: bool = False) -> None:
+        """
+        Align signed request timestamps with Binance server time (GET /fapi/v1/time).
+        """
+        now_m = time.monotonic()
+        if not force and (now_m - float(self._time_sync_monotonic or 0.0)) < 300.0:
+            return
+        try:
+            code, data, _ = self._request("GET", "/fapi/v1/time")
+            if code != 200 or not isinstance(data, dict):
+                return
+            server_ms = int(data.get("serverTime") or 0)
+            if server_ms <= 0:
+                return
+            local_ms = int(time.time() * 1000)
+            self._time_offset_ms = server_ms - local_ms
+            self._time_sync_monotonic = now_m
+        except Exception:
+            pass
+
+    def _format_client_order_id(self, client_order_id: Optional[str]) -> str:
+        raw = str(client_order_id or "").strip()
+        broker_id = str(self.broker_id or "").strip()
+        if not raw:
+            return ""
+        if not broker_id:
+            return raw[:36]
+        prefix = f"x-{broker_id}"
+        if raw.startswith(prefix):
+            return raw[:36]
+        suffix_budget = max(0, 36 - len(prefix))
+        if suffix_budget <= 0:
+            return prefix[:36]
+        return f"{prefix}{raw[:suffix_budget]}"
+
     def _signed_request(self, method: str, path: str, *, params: Dict[str, Any]) -> Dict[str, Any]:
-        p = dict(params or {})
-        # Use server-accepted timestamp in ms.
-        p["timestamp"] = int(time.time() * 1000)
-        qs = urlencode(p, doseq=True)
-        p["signature"] = self._sign(qs)
-        code, data, text = self._request(method, path, params=p, headers=self._signed_headers())
-        if code >= 400:
-            raise LiveTradingError(f"Binance HTTP {code}: {text[:500]}")
-        if isinstance(data, dict) and data.get("code") and int(data.get("code")) < 0:
-            raise LiveTradingError(f"Binance error: {data}")
-        return data if isinstance(data, dict) else {"raw": data}
+        self._ensure_server_time()
+        last_err: Optional[LiveTradingError] = None
+        for attempt in range(2):
+            p = dict(params or {})
+            p["timestamp"] = int(time.time() * 1000) + int(self._time_offset_ms)
+            if "recvWindow" not in p:
+                p["recvWindow"] = 10000
+            qs = urlencode(p, doseq=True)
+            p["signature"] = self._sign(qs)
+            code, data, text = self._request(method, path, params=p, headers=self._signed_headers())
+            if code >= 400:
+                err = LiveTradingError(f"Binance HTTP {code}: {text[:500]}")
+                if attempt == 0 and ("-1021" in text or "1021" in text):
+                    self._ensure_server_time(force=True)
+                    last_err = err
+                    continue
+                raise err
+            if isinstance(data, dict) and data.get("code") and int(data.get("code")) < 0:
+                err = LiveTradingError(f"Binance error: {data}")
+                if attempt == 0 and int(data.get("code") or 0) == -1021:
+                    self._ensure_server_time(force=True)
+                    last_err = err
+                    continue
+                raise err
+            return data if isinstance(data, dict) else {"raw": data}
+        if last_err:
+            raise last_err
+        raise LiveTradingError("Binance signed request failed")
 
     def _public_request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         code, data, text = self._request(method, path, params=params, headers=None, json_body=None, data=None)
@@ -399,33 +459,51 @@ class BinanceFuturesClient(BaseRestClient):
         data = self._signed_request("GET", "/fapi/v1/userTrades", params=params)
         return data
 
-    def get_fee_for_order(self, *, symbol: str, order_id: str) -> Tuple[float, str]:
+    def get_fee_for_order(self, *, symbol: str, order_id: str, max_retries: int = 3) -> Tuple[float, str]:
         """
         Best-effort: sum commissions from fills for a specific order.
+        Retries a few times because userTrades may lag behind order fill.
 
         Returns: (total_fee, fee_ccy)
         """
-        try:
-            trades = self.get_user_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
-        except Exception:
-            trades = []
-        if not isinstance(trades, list):
-            return 0.0, ""
-        total_fee = 0.0
-        fee_ccy = ""
-        for t in trades:
-            if not isinstance(t, dict):
-                continue
+        for attempt in range(max(1, max_retries)):
             try:
-                fee = float(t.get("commission") or 0.0)
+                trades = self.get_user_trades(symbol=symbol, order_id=str(order_id or ""), limit=200)
             except Exception:
-                fee = 0.0
-            ccy = str(t.get("commissionAsset") or "").strip()
-            if fee != 0.0:
-                total_fee += abs(float(fee))
-                if (not fee_ccy) and ccy:
-                    fee_ccy = ccy
-        return float(total_fee), str(fee_ccy or "")
+                trades = []
+            if not isinstance(trades, list):
+                trades = []
+            total_fee = 0.0
+            fee_ccy = ""
+            for t in trades:
+                if not isinstance(t, dict):
+                    continue
+                try:
+                    fee = float(t.get("commission") or 0.0)
+                except Exception:
+                    fee = 0.0
+                ccy = str(t.get("commissionAsset") or "").strip()
+                if fee != 0.0:
+                    total_fee += abs(float(fee))
+                    if (not fee_ccy) and ccy:
+                        fee_ccy = ccy
+            if total_fee > 0 or attempt >= max_retries - 1:
+                return float(total_fee), str(fee_ccy or "")
+            time.sleep(1.0)
+        return 0.0, ""
+
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        sym = symbol.upper().replace("-", "").replace("/", "")
+        try:
+            data = self._signed_request("GET", "/fapi/v1/commissionRate", params={"symbol": sym})
+            if isinstance(data, dict):
+                maker = abs(float(data.get("makerCommissionRate") or 0))
+                taker = abs(float(data.get("takerCommissionRate") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"Binance get_fee_rate({symbol}) failed: {e}")
+        return None
 
     def set_leverage(self, *, symbol: str, leverage: float) -> Dict[str, Any]:
         """
@@ -541,12 +619,15 @@ class BinanceFuturesClient(BaseRestClient):
         poll_interval_sec: float = 0.5,
     ) -> Dict[str, Any]:
         """
-        Poll order detail to obtain (best-effort) executed quantity and average price.
+        Poll order detail to obtain (best-effort) executed quantity, average price,
+        and commission (via userTrades).
 
         Returns:
         {
           "filled": float,
           "avg_price": float,
+          "fee": float,
+          "fee_ccy": str,
           "status": str,
           "order": {...}
         }
@@ -566,7 +647,6 @@ class BinanceFuturesClient(BaseRestClient):
             except Exception:
                 filled = 0.0
 
-            # Futures order endpoint usually provides avgPrice; fall back to price/cumQuote.
             avg_price = 0.0
             try:
                 if last.get("avgPrice") is not None and str(last.get("avgPrice")).strip() != "":
@@ -587,14 +667,70 @@ class BinanceFuturesClient(BaseRestClient):
                     avg_price = 0.0
 
             if filled > 0 and avg_price > 0:
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
 
             if status in ("FILLED", "CANCELED", "EXPIRED", "REJECTED"):
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = 0.0, ""
+                if filled > 0:
+                    fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
 
             if time.time() >= end_ts:
-                return {"filled": filled, "avg_price": avg_price, "status": status, "order": last}
+                fee, fee_ccy = 0.0, ""
+                if filled > 0:
+                    fee, fee_ccy = self._fetch_commission_for_order(symbol=symbol, order_id=order_id, filled=filled, avg_price=avg_price)
+                return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
+
+    def _fetch_commission_for_order(self, *, symbol: str, order_id: str, filled: float, avg_price: float) -> Tuple[float, str]:
+        """Fetch real commission from userTrades; fall back to commissionRate calculation."""
+        oid = str(order_id or "").strip()
+        # Method 1: userTrades (up to 3 attempts with 1s delay)
+        for attempt in range(3):
+            try:
+                trades = self.get_user_trades(symbol=symbol, order_id=oid, limit=200) if oid else []
+                if not isinstance(trades, list):
+                    trades = []
+                total_fee = 0.0
+                fee_ccy = ""
+                for t in trades:
+                    if not isinstance(t, dict):
+                        continue
+                    try:
+                        c = float(t.get("commission") or 0.0)
+                    except (ValueError, TypeError):
+                        c = 0.0
+                    ccy = str(t.get("commissionAsset") or "").strip()
+                    if c != 0.0:
+                        total_fee += abs(c)
+                        if not fee_ccy and ccy:
+                            fee_ccy = ccy
+                if total_fee > 0:
+                    logger.debug("Binance fee via userTrades: %.8f %s (order=%s, attempt=%d)", total_fee, fee_ccy, oid, attempt)
+                    return total_fee, fee_ccy
+                if attempt < 2:
+                    time.sleep(1.5)
+            except Exception as e:
+                logger.warning("Binance userTrades fee query failed (attempt=%d): %s", attempt, e)
+                if attempt < 2:
+                    time.sleep(1.0)
+
+        # Method 2: calculate from commissionRate
+        if filled > 0 and avg_price > 0:
+            try:
+                rate_info = self.get_fee_rate(symbol=symbol)
+                if rate_info:
+                    taker_rate = float(rate_info.get("taker") or 0.0)
+                    if taker_rate > 0:
+                        calc_fee = filled * avg_price * taker_rate
+                        logger.info("Binance fee via commissionRate: %.8f USDT (rate=%.6f, order=%s)", calc_fee, taker_rate, oid)
+                        return calc_fee, "USDT"
+            except Exception as e:
+                logger.warning("Binance commissionRate fallback failed: %s", e)
+
+        logger.warning("Binance could not obtain fee for order=%s symbol=%s", oid, symbol)
+        return 0.0, ""
 
     def place_market_order(
         self,
@@ -647,10 +783,9 @@ class BinanceFuturesClient(BaseRestClient):
             "type": "MARKET",
             "quantity": self._dec_str(q_dec, strict_precision=qty_precision),
         }
-        if reduce_only:
-            params["reduceOnly"] = "true"
-        if client_order_id:
-            params["newClientOrderId"] = str(client_order_id)
+        client_order_id_norm = self._format_client_order_id(client_order_id)
+        if client_order_id_norm:
+            params["newClientOrderId"] = client_order_id_norm
 
         # Hedge mode requires explicit positionSide (LONG/SHORT). One-way mode should not use LONG/SHORT.
         dual_side = self.get_dual_side_position()
@@ -663,6 +798,10 @@ class BinanceFuturesClient(BaseRestClient):
         else:
             # Unknown mode: try without positionSide first; we may retry on -4061.
             params.pop("positionSide", None)
+
+        # reduceOnly after positionSide: in hedge mode, Binance returns -1106 if both are sent.
+        if reduce_only and not (dual_side is True and params.get("positionSide") in ("LONG", "SHORT")):
+            params["reduceOnly"] = "true"
 
         try:
             raw = self._signed_request("POST", "/fapi/v1/order", params=params)
@@ -689,6 +828,7 @@ class BinanceFuturesClient(BaseRestClient):
                 else:
                     # Likely hedge mode; retry with inferred positionSide.
                     params2["positionSide"] = (pos_norm if pos_norm in ("LONG", "SHORT") else self._infer_position_side(side=sd, reduce_only=reduce_only))
+                    params2.pop("reduceOnly", None)
                     try:
                         raw = self._signed_request("POST", "/fapi/v1/order", params=params2)
                         self._dual_side_cache = (time.time(), True)
@@ -785,10 +925,9 @@ class BinanceFuturesClient(BaseRestClient):
             "quantity": self._dec_str(q_dec, strict_precision=qty_precision),
             "price": self._dec_str(px_dec),
         }
-        if reduce_only:
-            params["reduceOnly"] = "true"
-        if client_order_id:
-            params["newClientOrderId"] = str(client_order_id)
+        client_order_id_norm = self._format_client_order_id(client_order_id)
+        if client_order_id_norm:
+            params["newClientOrderId"] = client_order_id_norm
 
         dual_side = self.get_dual_side_position()
         pos_norm = self._normalize_position_side(position_side)
@@ -798,6 +937,9 @@ class BinanceFuturesClient(BaseRestClient):
             params.pop("positionSide", None)
         else:
             params.pop("positionSide", None)
+
+        if reduce_only and not (dual_side is True and params.get("positionSide") in ("LONG", "SHORT")):
+            params["reduceOnly"] = "true"
         try:
             raw = self._signed_request("POST", "/fapi/v1/order", params=params)
         except LiveTradingError as e:
@@ -819,6 +961,7 @@ class BinanceFuturesClient(BaseRestClient):
                         pass
                 else:
                     params2["positionSide"] = (pos_norm if pos_norm in ("LONG", "SHORT") else self._infer_position_side(side=sd, reduce_only=reduce_only))
+                    params2.pop("reduceOnly", None)
                     try:
                         raw = self._signed_request("POST", "/fapi/v1/order", params=params2)
                         self._dual_side_cache = (time.time(), True)
@@ -852,12 +995,41 @@ class BinanceFuturesClient(BaseRestClient):
             raise LiveTradingError("Binance cancel_order requires order_id or client_order_id")
         return self._signed_request("DELETE", "/fapi/v1/order", params=params)
 
-    def get_positions(self) -> Any:
+    def set_margin_type(self, *, symbol: str, margin_mode: str) -> Dict[str, Any]:
         """
-        Return all futures positions (position risk endpoint).
+        Set symbol margin mode on USDT-M futures.
+
+        Endpoint: POST /fapi/v1/marginType
+        margin_mode: cross | crossed | isolated
+        """
+        sym = to_binance_futures_symbol(symbol)
+        m = (margin_mode or "").strip().lower()
+        if m in ("cross", "crossed"):
+            mt = "CROSSED"
+        elif m in ("isolated", "iso"):
+            mt = "ISOLATED"
+        else:
+            raise LiveTradingError(f"Invalid margin_mode for Binance: {margin_mode}")
+        return self._signed_request("POST", "/fapi/v1/marginType", params={"symbol": sym, "marginType": mt})
+
+    def get_positions(self, *, symbol: str = "") -> Any:
+        """
+        Futures positions (position risk). Optional ``symbol`` filters to one contract.
 
         Endpoint: GET /fapi/v2/positionRisk
         """
-        return self._signed_request("GET", "/fapi/v2/positionRisk", params={})
+        raw = self._signed_request("GET", "/fapi/v2/positionRisk", params={})
+        rows: list
+        if isinstance(raw, list):
+            rows = raw
+        elif isinstance(raw, dict) and isinstance(raw.get("raw"), list):
+            rows = raw["raw"]
+        else:
+            rows = []
+        want = (symbol or "").strip()
+        if not want:
+            return rows
+        sym = to_binance_futures_symbol(want)
+        return [p for p in rows if isinstance(p, dict) and str(p.get("symbol") or "") == sym]
 
 

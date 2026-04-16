@@ -4,6 +4,521 @@ This document records version updates, new features, bug fixes, and database mig
 
 ---
 
+## 2026-04-07 — 数据库：`qd_market_symbols` 补充 A股 / H股热门标的
+
+已在 **Docker** 内对运行中的 PostgreSQL 执行完毕（`INSERT 0 20`）。**新库**若使用当前仓库中的 `migrations/init.sql` 初始化，已包含同批种子数据，无需重复执行。
+
+**在已有库上手动执行（等价 SQL，可重复执行，`ON CONFLICT DO NOTHING`）：**
+
+```sql
+INSERT INTO qd_market_symbols (market, symbol, name, exchange, currency, is_active, is_hot, sort_order) VALUES
+('CNStock', '600519', '贵州茅台', 'SSE', 'CNY', 1, 1, 100),
+('CNStock', '600036', '招商银行', 'SSE', 'CNY', 1, 1, 99),
+('CNStock', '601318', '中国平安', 'SSE', 'CNY', 1, 1, 98),
+('CNStock', '600900', '长江电力', 'SSE', 'CNY', 1, 1, 97),
+('CNStock', '601899', '紫金矿业', 'SSE', 'CNY', 1, 1, 96),
+('CNStock', '000858', '五粮液', 'SZSE', 'CNY', 1, 1, 95),
+('CNStock', '000333', '美的集团', 'SZSE', 'CNY', 1, 1, 94),
+('CNStock', '002594', '比亚迪', 'SZSE', 'CNY', 1, 1, 93),
+('CNStock', '300750', '宁德时代', 'SZSE', 'CNY', 1, 1, 92),
+('CNStock', '000001', '平安银行', 'SZSE', 'CNY', 1, 1, 91),
+('HKStock', '00700', '腾讯控股', 'HKEX', 'HKD', 1, 1, 100),
+('HKStock', '09988', '阿里巴巴-W', 'HKEX', 'HKD', 1, 1, 99),
+('HKStock', '03690', '美团-W', 'HKEX', 'HKD', 1, 1, 98),
+('HKStock', '01810', '小米集团-W', 'HKEX', 'HKD', 1, 1, 97),
+('HKStock', '00939', '建设银行', 'HKEX', 'HKD', 1, 1, 96),
+('HKStock', '01299', '友邦保险', 'HKEX', 'HKD', 1, 1, 95),
+('HKStock', '02318', '中国平安', 'HKEX', 'HKD', 1, 1, 94),
+('HKStock', '00388', '香港交易所', 'HKEX', 'HKD', 1, 1, 93),
+('HKStock', '00883', '中国海洋石油', 'HKEX', 'HKD', 1, 1, 92),
+('HKStock', '01398', '工商银行', 'HKEX', 'HKD', 1, 1, 91)
+ON CONFLICT (market, symbol) DO NOTHING;
+```
+
+**Docker 一行示例（文件需 UTF-8）：**
+
+```bash
+docker cp backend_api_python/migrations/<your>.sql quantdinger-db:/tmp/migrate.sql
+docker compose exec -T postgres psql -U quantdinger -d quantdinger -f /tmp/migrate.sql
+```
+
+---
+
+## V3.0.1 (2026-04-05) — Frontend / docs
+
+- **前端版本**：私有 Vue 仓库 `package.json`、页脚展示与 `frontend/VERSION` 统一为 **3.0.1**。
+- **文档**：根目录 `README.md` 与 `docs/README_CN.md` 补充 QuantDinger 专属交易所邀请注册链接表（与个人中心「开户」一致），版本徽章更新为 3.0.1。
+- **回测中心**：暗黑主题下图标与「添加标的」等弹窗样式对齐（`a-icon`、图表标题区、Modal 挂载层）。
+
+---
+
+## V2.2.4 (2026-04-05)
+
+### 🚀 New Features
+
+- **真实策略回测主链路**: 新增基于 `strategyId` 的策略回测入口，支持已保存的 `IndicatorStrategy` 与 `ScriptStrategy`，不再只是“取指标再跑一次指标回测”。
+- **策略快照解析层**: 后端新增统一策略快照解析逻辑，把 `indicator_config`、`trading_config`、`strategy_code` 解析为可回测的标准输入。
+- **策略回测历史与详情**: 回测记录现在可区分 `indicator` / `strategy_indicator` / `strategy_script`，并支持策略回测历史、详情查看和 AI 修正建议链路。
+- **交易助手联动回测中心**: 交易助手中的策略项新增回测跳转入口，可直接带 `strategy_id` 进入回测中心。
+
+### 🐛 Bug Fixes
+
+- Fixed the previous “策略回测” pseudo-flow that only reused `/api/indicator/backtest` and could not faithfully replay stored strategies.
+- Fixed strategy backtest history semantics so records can be linked to concrete strategies instead of only relying on `indicator_id`.
+- Fixed strategy backtest UI entry restoration in Backtest Center and wired the strategy selector/history drawer to real backend endpoints.
+
+### 🎨 UI/UX Improvements
+
+- Restored the `回测中心 -> 策略回测` tab with strategy summary cards and environment override controls.
+- Unified strategy backtest history display with the existing run viewer and AI suggestion modal.
+
+### 📋 Database Migration
+
+**在已有 PostgreSQL 库上执行（新库若已通过更新后的 `migrations/init.sql` 初始化则无需再执行）：**
+
+```sql
+-- ============================================================
+-- QuantDinger V2.2.4 Database Migration
+-- Strategy Backtest Persistence Upgrade
+-- ============================================================
+
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS strategy_id INTEGER;
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS strategy_name VARCHAR(255) DEFAULT '';
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS run_type VARCHAR(50) DEFAULT 'indicator';
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS config_snapshot TEXT DEFAULT '';
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS engine_version VARCHAR(50) DEFAULT '';
+ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS code_hash VARCHAR(128) DEFAULT '';
+
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy_id ON qd_backtest_runs(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_type ON qd_backtest_runs(run_type);
+
+CREATE TABLE IF NOT EXISTS qd_backtest_trades (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
+    strategy_id INTEGER,
+    trade_index INTEGER DEFAULT 0,
+    trade_time VARCHAR(64) DEFAULT '',
+    trade_type VARCHAR(64) DEFAULT '',
+    side VARCHAR(32) DEFAULT '',
+    price DOUBLE PRECISION DEFAULT 0,
+    amount DOUBLE PRECISION DEFAULT 0,
+    profit DOUBLE PRECISION DEFAULT 0,
+    balance DOUBLE PRECISION DEFAULT 0,
+    reason VARCHAR(64) DEFAULT '',
+    payload_json TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id ON qd_backtest_trades(run_id);
+
+CREATE TABLE IF NOT EXISTS qd_backtest_equity_points (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    point_index INTEGER DEFAULT 0,
+    point_time VARCHAR(64) DEFAULT '',
+    point_value DOUBLE PRECISION DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_equity_points_run_id ON qd_backtest_equity_points(run_id);
+```
+
+### 📝 Migration Notes
+
+- All statements are idempotent and safe to run multiple times.
+- Existing backtest data is preserved.
+- Existing `indicator` backtest records remain compatible; new strategy backtests will write `run_type`, `strategy_id`, `strategy_name`, `config_snapshot`, `engine_version`, and `code_hash`.
+- `qd_backtest_trades` and `qd_backtest_equity_points` are introduced for future strategy-level analytics and debugging.
+
+---
+
+## V2.2.3 (2026-03-24)
+
+### 🚀 New Features
+
+- **User profile IANA timezone (`qd_users.timezone`)**: 个人资料可保存时区（IANA 标识，如 `Asia/Shanghai`）；为空表示跟随浏览器。登录态 `/api/auth/info`、资料接口与前端 AI 分析页等时间展示会按该时区调用 `toLocaleString(..., { timeZone })`（非法或空则回退本机时区）。
+
+### 📋 Database Migration
+
+**在已有 PostgreSQL 库上执行（新库若已通过更新后的 `migrations/init.sql` 初始化则无需再执行）：**
+
+```sql
+-- ============================================================
+-- QuantDinger V2.2.3 — qd_users.timezone（用户资料时区）
+-- ============================================================
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'qd_users'
+          AND column_name = 'timezone'
+    ) THEN
+        ALTER TABLE qd_users ADD COLUMN timezone VARCHAR(64) DEFAULT '';
+        RAISE NOTICE 'Added timezone column to qd_users table';
+    END IF;
+END $$;
+```
+
+**仅当列不存在时的一行式写法（自行确认无列后再执行）：**
+
+```sql
+ALTER TABLE qd_users ADD COLUMN IF NOT EXISTS timezone VARCHAR(64) DEFAULT '';
+```
+
+> 说明：`ALTER TABLE ... ADD COLUMN IF NOT EXISTS` 需 **PostgreSQL 11+**（本仓库 Docker 默认 `postgres:16` 可用）；与上面 `DO` 块二选一即可。
+
+---
+
+## V2.2.2 (2026-02-28)
+
+### 🚀 New Features
+
+#### Polymarket Prediction Markets Integration 🔮
+- **Prediction Market Analysis**: Integrated Polymarket prediction markets as a new data source for AI analysis
+- **AI-Driven Insights**: AI analyzes prediction market events and compares AI predictions with market consensus
+- **Opportunity Discovery**: Identifies undervalued prediction opportunities with AI vs market divergence analysis
+- **Asset Trading Recommendations**: Links prediction market events to related asset trading opportunities (e.g., BTC/USDT, ETH/USDT)
+- **Data Analysis Only**: Focuses on data analysis and trading opportunity recommendations without live trading
+- **Frontend Pages**: New `/polymarket` page with market listings, filtering, sorting, and search functionality
+- **Market Detail View**: Comprehensive analysis view showing market info, AI analysis results, and related asset opportunities
+- **AI Trading Radar Integration**: Prediction market opportunities appear in the AI Trading Radar alongside Crypto, US Stocks, and Forex
+
+### 🐛 Bug Fixes
+- Fixed duplicate `common.refresh` key in internationalization files (`zh-CN.js` and `en-US.js`)
+- Fixed OKX position `entry_price` extraction (now correctly reads `avgPx`, `avgPxEp`, or `last` from position data)
+- Improved symbol normalization across all exchanges to handle edge cases (e.g., PI, TRX without quote currency)
+- Enhanced LLM provider fallback mechanism to handle 403/402/404/429 errors automatically
+
+### 🎨 UI/UX Improvements
+- Added Polymarket market cards with AI analysis summaries and opportunity scores
+- Enhanced AI Trading Radar to display prediction market opportunities with distinct styling
+- Improved symbol selector in Quick Trade panel with watchlist integration
+
+### 📋 Database Migration
+
+**Run the following SQL on your PostgreSQL database before deploying V2.2.2:**
+
+```sql
+-- ============================================================
+-- QuantDinger V2.2.2 Database Migration
+-- Polymarket Prediction Markets Integration
+-- ============================================================
+
+-- 预测市场表（缓存）
+CREATE TABLE IF NOT EXISTS qd_polymarket_markets (
+    id SERIAL PRIMARY KEY,
+    market_id VARCHAR(255) UNIQUE NOT NULL,
+    question TEXT,
+    category VARCHAR(100),  -- crypto, politics, economics, sports
+    current_probability DECIMAL(5,2),  -- YES概率（0-100）
+    volume_24h DECIMAL(20,2),
+    liquidity DECIMAL(20,2),
+    end_date_iso TIMESTAMP,
+    status VARCHAR(50),  -- active, closed, resolved
+    outcome_tokens JSONB,  -- YES/NO价格和交易量
+    slug VARCHAR(255),  -- Polymarket事件slug，用于构建URL
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- 添加slug字段（如果表已存在但字段不存在）
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'qd_polymarket_markets' AND column_name = 'slug'
+    ) THEN
+        ALTER TABLE qd_polymarket_markets ADD COLUMN slug VARCHAR(255);
+        RAISE NOTICE 'Added slug column to qd_polymarket_markets';
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_polymarket_category ON qd_polymarket_markets(category);
+CREATE INDEX IF NOT EXISTS idx_polymarket_status ON qd_polymarket_markets(status);
+CREATE INDEX IF NOT EXISTS idx_polymarket_updated ON qd_polymarket_markets(updated_at DESC);
+
+-- AI分析记录表
+CREATE TABLE IF NOT EXISTS qd_polymarket_ai_analysis (
+    id SERIAL PRIMARY KEY,
+    market_id VARCHAR(255) NOT NULL,
+    user_id INTEGER,  -- 可选：用户特定的分析
+    ai_predicted_probability DECIMAL(5,2),
+    market_probability DECIMAL(5,2),
+    divergence DECIMAL(5,2),  -- AI - 市场
+    recommendation VARCHAR(20),  -- YES/NO/HOLD
+    confidence_score DECIMAL(5,2),
+    opportunity_score DECIMAL(5,2),
+    reasoning TEXT,
+    key_factors JSONB,
+    related_assets TEXT[],  -- 相关资产列表
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_polymarket_analysis_market ON qd_polymarket_ai_analysis(market_id);
+CREATE INDEX IF NOT EXISTS idx_polymarket_analysis_opportunity ON qd_polymarket_ai_analysis(opportunity_score DESC);
+CREATE INDEX IF NOT EXISTS idx_polymarket_analysis_user ON qd_polymarket_ai_analysis(user_id);
+
+-- 资产交易机会表（基于预测市场生成）
+CREATE TABLE IF NOT EXISTS qd_polymarket_asset_opportunities (
+    id SERIAL PRIMARY KEY,
+    market_id VARCHAR(255) NOT NULL,
+    asset_symbol VARCHAR(100),
+    asset_market VARCHAR(50),
+    signal VARCHAR(20),  -- BUY/SELL/HOLD
+    confidence DECIMAL(5,2),
+    reasoning TEXT,
+    entry_suggestion JSONB,  -- 入场建议
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_polymarket_opp_market ON qd_polymarket_asset_opportunities(market_id);
+CREATE INDEX IF NOT EXISTS idx_polymarket_opp_asset ON qd_polymarket_asset_opportunities(asset_symbol, asset_market);
+
+-- Migration Complete
+DO $$
+BEGIN
+    RAISE NOTICE '✅ QuantDinger V2.2.2 database migration completed!';
+END $$;
+```
+
+**Migration Notes:**
+- All statements use `IF NOT EXISTS` — safe to run multiple times
+- No existing data is modified or deleted
+- New tables are created for Polymarket data caching and AI analysis
+- Polymarket integration is read-only (data analysis only, no live trading)
+
+### 📝 Configuration Notes
+- No new environment variables required for basic Polymarket integration
+- Polymarket data source uses placeholder/dummy data by default (can be extended with actual API integration)
+- AI analysis leverages existing LLM configuration from System Settings
+
+---
+
+## V2.2.1 (2026-02-27)
+
+### 🚀 New Features
+
+#### Membership & Billing System
+- **Subscription Plans**: Monthly / Yearly / Lifetime tiers with configurable pricing and credit bundles
+- **Credit System**: Each plan includes credits; lifetime members receive recurring monthly credit bonuses
+- **Plan Management**: All plan prices, credits, and bonus amounts configurable via System Settings → Billing Configuration
+- **Membership Orders**: Order tracking with status management (paid / pending / failed / refunded)
+
+#### USDT On-Chain Payment (TRC20)
+- **HD Wallet Integration**: Per-order unique receiving address derived from xpub (BIP-32/44) — no private key on server
+- **Automatic Reconciliation**: Background polling via TronGrid API detects incoming payments and confirms orders
+- **Depth-Flexible xpub**: Supports both account-level (depth=3) and change-level (depth=4) xpub keys
+- **Configurable Expiry**: Order expiration time and confirmation delay configurable in System Settings
+- **Scan-to-Pay Modal**: Professional checkout UI with QR code, step indicator, real-time status, copy-to-clipboard, dark theme support
+
+#### VIP Free Indicators
+- **VIP Free Tag**: Admins can mark community indicators as "VIP Free" when publishing
+- **Zero-Credit Access**: VIP members can use VIP-free indicators without spending credits
+- **Visual Badge**: VIP Free indicators display a distinct badge in the Indicator Market
+
+#### AI Trading Opportunities Radar
+- **Multi-Market Scanning**: Auto-scans Crypto, US Stocks, and Forex markets every hour
+- **Rolling Carousel**: Opportunities displayed in a rotating carousel with market-specific styling
+- **Signal Classification**: BUY / SELL signals with percentage change and reason text
+- **Multi-Language**: All radar card content fully internationalized
+
+#### Simplified Strategy Creation
+- **Simple / Advanced Mode Toggle**: New users start with simplified mode, power users can switch to advanced
+- **Smart Defaults**: 15-minute K-line period, 5x leverage, market order, sensible TP/SL percentages
+- **Live Trading Disclaimer**: Mandatory risk acknowledgment checkbox before enabling live trading
+
+#### System Settings Simplification
+- **Streamlined Configuration**: Removed redundant config groups (server, strategy); consolidated into essential categories
+- **Market Order Default**: Changed default order mode to market order for reliable execution
+- **Billing Config i18n**: All billing configuration items fully multi-language supported
+
+#### Quick Trade Panel (闪电交易) 🆕
+- **Side-Sliding Drawer**: Professional trading panel slides in from the right, allowing instant order placement without leaving the analysis page
+- **Multi-Exchange Support**: Select from saved exchange credentials (Binance, OKX, Bitget, Bybit, etc.) with real-time balance display
+- **Long/Short Toggle**: Color-coded direction buttons with one-click switching
+- **Market / Limit Orders**: Toggle between market and limit order types; limit orders accept a specific price
+- **Leverage Slider**: Interactive 1x–125x leverage control for futures trading
+- **TP/SL Price Setting**: Optional take-profit and stop-loss by **absolute price** (not percentage)
+- **Current Position Display**: Shows open position with side, size, entry price, unrealized PnL, and one-click close button
+- **Recent Trade History**: Displays last 5 quick trades with status tags
+- **AI Radar Integration**: "Trade Now" button on each AI Trading Opportunities card pre-fills symbol, direction, and price
+- **Indicator Analysis Integration**: Quick Trade button in chart header and floating ⚡ button pre-fills current symbol and price
+- **Auto-Polling**: Balance and position data refresh every 10 seconds
+- **Full Dark Theme**: Complete dark mode support for all panel elements
+- **Multi-Language**: All labels and messages fully internationalized (zh-CN / en-US)
+
+#### Indicator Market Performance Tracking
+- **Live Performance Data**: Fixed aggregation to correctly parse backtest `result_json` and include live trade data
+- **Combined Metrics**: Backtest return, live PnL, and win rate now properly displayed on indicator cards
+
+### 🐛 Bug Fixes
+- Fixed `quick_trade.py` importing from non-existent `auth_utils` module (corrected to `auth`)
+- Fixed "Live Performance" data showing all zeros in Indicator Market (incorrect SQL query referencing non-existent columns)
+- Fixed incorrect entry price display in Position Records (was falling back to current price)
+- Fixed inaccurate System Overview statistics for running strategies, total capital, and total PnL
+- Fixed multiple duplicate i18n key issues in `zh-CN.js` and `en-US.js` causing ESLint build failures
+- Fixed exposed i18n keys (`common.loading`, `common.noData`, `systemOverview.*`) not configured
+- Fixed HTML nesting issues in trading assistant strategy creation form
+- Fixed `ed25519-blake2b` build failure in Docker by adding temporary build dependencies
+- Fixed "Current depth (3) is not suitable for deriving address" error for xpub — now compatible with both depth 3 and depth 4
+
+### 🎨 UI/UX Improvements
+- Removed "Total Analyses" / "Accuracy Rate" row from homepage AI Analysis section
+- Removed "Search" and "Portfolio Checkup" features from AI Asset Analysis page
+- Professional USDT checkout modal with custom header, step indicator, dual-column layout
+- Dark theme and mobile responsive support for payment modal
+- Trading Opportunities Radar carousel with smooth scrolling animation
+
+### 📋 Database Migration
+
+**Run the following SQL on your PostgreSQL database before deploying V2.2.1:**
+
+```sql
+-- ============================================================
+-- QuantDinger V2.2.1 Database Migration
+-- Membership, USDT Payment, VIP Free Indicators
+-- ============================================================
+
+-- 1. User Table: Add membership columns
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_users' AND column_name = 'vip_plan'
+    ) THEN
+        ALTER TABLE qd_users ADD COLUMN vip_plan VARCHAR(20) DEFAULT '';
+        RAISE NOTICE 'Added vip_plan column to qd_users';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_users' AND column_name = 'vip_is_lifetime'
+    ) THEN
+        ALTER TABLE qd_users ADD COLUMN vip_is_lifetime BOOLEAN DEFAULT FALSE;
+        RAISE NOTICE 'Added vip_is_lifetime column to qd_users';
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_users' AND column_name = 'vip_monthly_credits_last_grant'
+    ) THEN
+        ALTER TABLE qd_users ADD COLUMN vip_monthly_credits_last_grant TIMESTAMP;
+        RAISE NOTICE 'Added vip_monthly_credits_last_grant column to qd_users';
+    END IF;
+END $$;
+
+-- 2. Indicator Codes: Add VIP Free flag
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_indicator_codes' AND column_name = 'vip_free'
+    ) THEN
+        ALTER TABLE qd_indicator_codes ADD COLUMN vip_free BOOLEAN DEFAULT FALSE;
+        RAISE NOTICE 'Added vip_free column to qd_indicator_codes';
+    END IF;
+END $$;
+
+-- 3. Membership Orders table
+CREATE TABLE IF NOT EXISTS qd_membership_orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    plan VARCHAR(20) NOT NULL,
+    price_usd DECIMAL(10,2) DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'paid',
+    created_at TIMESTAMP DEFAULT NOW(),
+    paid_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_membership_orders_user_id ON qd_membership_orders(user_id);
+
+-- 4. USDT Orders table (on-chain payment tracking)
+CREATE TABLE IF NOT EXISTS qd_usdt_orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    plan VARCHAR(20) NOT NULL,
+    chain VARCHAR(20) NOT NULL DEFAULT 'TRC20',
+    amount_usdt DECIMAL(20,6) NOT NULL DEFAULT 0,
+    address_index INTEGER NOT NULL DEFAULT 0,
+    address VARCHAR(80) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    tx_hash VARCHAR(120) DEFAULT '',
+    paid_at TIMESTAMP,
+    confirmed_at TIMESTAMP,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usdt_orders_address_unique ON qd_usdt_orders(chain, address);
+CREATE INDEX IF NOT EXISTS idx_usdt_orders_user_id ON qd_usdt_orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_usdt_orders_status ON qd_usdt_orders(status);
+
+-- 5. Quick Trades table (manual / discretionary orders from Quick Trade Panel)
+CREATE TABLE IF NOT EXISTS qd_quick_trades (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    credential_id   INTEGER DEFAULT 0,
+    exchange_id     VARCHAR(40) NOT NULL DEFAULT '',
+    symbol          VARCHAR(60) NOT NULL DEFAULT '',
+    side            VARCHAR(10) NOT NULL DEFAULT '',       -- buy / sell
+    order_type      VARCHAR(20) NOT NULL DEFAULT 'market', -- market / limit
+    amount          DECIMAL(24, 8) DEFAULT 0,
+    price           DECIMAL(24, 8) DEFAULT 0,
+    leverage        INTEGER DEFAULT 1,
+    market_type     VARCHAR(20) DEFAULT 'swap',            -- swap / spot
+    tp_price        DECIMAL(24, 8) DEFAULT 0,
+    sl_price        DECIMAL(24, 8) DEFAULT 0,
+    status          VARCHAR(20) DEFAULT 'submitted',       -- submitted / filled / failed / cancelled
+    exchange_order_id VARCHAR(120) DEFAULT '',
+    filled_amount   DECIMAL(24, 8) DEFAULT 0,
+    avg_fill_price  DECIMAL(24, 8) DEFAULT 0,
+    error_msg       TEXT DEFAULT '',
+    source          VARCHAR(40) DEFAULT 'manual',          -- ai_radar / ai_analysis / indicator / manual
+    raw_result      JSONB,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_quick_trades_user    ON qd_quick_trades(user_id);
+CREATE INDEX IF NOT EXISTS idx_quick_trades_created ON qd_quick_trades(created_at DESC);
+
+-- Migration Complete
+DO $$
+BEGIN
+    RAISE NOTICE '✅ QuantDinger V2.2.1 database migration completed!';
+END $$;
+```
+
+**Migration Notes:**
+- All statements use `IF NOT EXISTS` — safe to run multiple times
+- No existing data is modified or deleted
+- New `.env` variables required for USDT payment: `USDT_PAY_ENABLED`, `USDT_TRC20_XPUB`, `TRONGRID_API_KEY`
+- New `.env` variables for membership pricing: `MEMBERSHIP_MONTHLY_PRICE_USD`, `MEMBERSHIP_MONTHLY_CREDITS`, etc.
+- See `backend_api_python/env.example` for all new configuration options
+
+### 📝 Configuration Notes
+
+New environment variables (all optional, with defaults):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMBERSHIP_MONTHLY_PRICE_USD` | `19.9` | Monthly plan price |
+| `MEMBERSHIP_MONTHLY_CREDITS` | `500` | Credits included in monthly plan |
+| `MEMBERSHIP_YEARLY_PRICE_USD` | `169` | Yearly plan price |
+| `MEMBERSHIP_YEARLY_CREDITS` | `8000` | Credits included in yearly plan |
+| `MEMBERSHIP_LIFETIME_PRICE_USD` | `499` | Lifetime plan price |
+| `MEMBERSHIP_LIFETIME_CREDITS` | `30000` | Initial credits for lifetime plan |
+| `MEMBERSHIP_LIFETIME_MONTHLY_BONUS` | `500` | Monthly bonus credits for lifetime members |
+| `USDT_PAY_ENABLED` | `false` | Enable USDT TRC20 payment |
+| `USDT_TRC20_XPUB` | _(empty)_ | TRC20 HD wallet xpub for address derivation |
+| `TRONGRID_API_KEY` | _(empty)_ | TronGrid API key for on-chain monitoring |
+| `USDT_ORDER_EXPIRE_MINUTES` | `30` | USDT order expiration time |
+
+---
+
 ## V2.1.3 (2026-02-XX)
 
 ### 🚀 New Features
@@ -195,7 +710,7 @@ output = {
 - Fixed progress bar and timer not animating during AI analysis
 - Fixed missing i18n translations for various components
 - Fixed Tiingo API rate limit issues with caching
-- Fixed A-share and H-share data fetching with multiple fallback sources
+- Fixed data fetching with multiple fallback sources
 - Fixed watchlist price batch fetch timeout handling
 - Fixed heatmap multi-language support for commodities and forex
 - **Fixed AI analysis history not filtered by user** - All users were seeing the same history records; now each user only sees their own analysis history
@@ -418,6 +933,10 @@ END $$;
 
 | Version | Date | Highlights |
 |---------|------|------------|
+| V2.2.2 | 2026-02-28 | Polymarket prediction markets integration, AI-driven prediction analysis, asset trading recommendations |
+| V2.2.1 | 2026-02-27 | Membership & Billing, USDT TRC20 payment, VIP free indicators, AI Trading Radar, simplified strategy creation |
+| V2.1.3 | 2026-02-XX | Cross-sectional strategy support |
+| V2.1.2 | 2026-02-01 | Indicator parameters, cross-indicator calling |
 | V2.1.1 | 2026-01-31 | AI Analysis overhaul, Global Market integration, Indicator Community enhancements |
 
 ---

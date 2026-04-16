@@ -1,9 +1,14 @@
 """
 Backtest Service
 """
+import hashlib
+import json
 import math
+import threading
+import time as _time
 import traceback
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Dict, List, Any, Optional
 
 import pandas as pd
@@ -11,9 +16,49 @@ import numpy as np
 
 from app.data_sources import DataSourceFactory
 from app.utils.logger import get_logger
+from app.utils.db import get_db_connection
 from app.services.indicator_params import IndicatorParamsParser, IndicatorCaller
 
 logger = get_logger(__name__)
+
+
+class _KlineCache:
+    """Simple in-memory K-line cache with TTL to avoid repeated external API calls."""
+
+    def __init__(self, max_size: int = 64):
+        self._store: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+        self._max_size = max_size
+
+    @staticmethod
+    def _ttl_for_timeframe(timeframe: str) -> int:
+        if timeframe in ('1m', '5m', '15m', '30m'):
+            return 300   # 5 min for intraday
+        return 1800      # 30 min for daily+
+
+    def get(self, key: str) -> Optional[pd.DataFrame]:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            if _time.time() > entry['expires']:
+                del self._store[key]
+                return None
+            return entry['df'].copy()
+
+    def put(self, key: str, df: pd.DataFrame, timeframe: str):
+        ttl = self._ttl_for_timeframe(timeframe)
+        with self._lock:
+            if len(self._store) >= self._max_size:
+                oldest_key = min(self._store, key=lambda k: self._store[k]['expires'])
+                del self._store[oldest_key]
+            self._store[key] = {
+                'df': df.copy(),
+                'expires': _time.time() + ttl
+            }
+
+
+_kline_cache = _KlineCache()
 
 
 class BacktestService:
@@ -26,14 +71,82 @@ class BacktestService:
     }
     
     # Multi-timeframe backtest threshold configuration
-    # 1m backtest: max 1 month (~43,200 candles)
+    # 1m backtest: max 15 days (~21,600 candles) - reduced for performance
     # 5m backtest: max 1 year (~105,120 candles)
     MTF_CONFIG = {
-        'max_1m_days': 30,        # Max days for 1-minute backtest
+        'max_1m_days': 15,        # Max days for 1-minute backtest (reduced from 30 for performance)
         'max_5m_days': 365,       # Max days for 5-minute backtest
         'default_exec_tf': '1m',  # Default execution timeframe
         'fallback_exec_tf': '5m', # Fallback execution timeframe
     }
+
+    ENGINE_VERSION = 'strategy-backtest-v1'
+
+    def __init__(self):
+        self._storage_schema_ready = False
+
+    def ensure_storage_schema(self) -> None:
+        if self._storage_schema_ready:
+            return
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute("ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS run_type VARCHAR(50) DEFAULT 'indicator'")
+                cur.execute("ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS strategy_id INTEGER")
+                cur.execute("ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS strategy_name VARCHAR(255) DEFAULT ''")
+                cur.execute("ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS config_snapshot TEXT DEFAULT ''")
+                cur.execute("ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS engine_version VARCHAR(50) DEFAULT ''")
+                cur.execute("ALTER TABLE qd_backtest_runs ADD COLUMN IF NOT EXISTS code_hash VARCHAR(128) DEFAULT ''")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy_id ON qd_backtest_runs(strategy_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_type ON qd_backtest_runs(run_type)")
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS qd_backtest_trades (
+                        id SERIAL PRIMARY KEY,
+                        run_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL DEFAULT 1,
+                        strategy_id INTEGER,
+                        trade_index INTEGER DEFAULT 0,
+                        trade_time VARCHAR(64) DEFAULT '',
+                        trade_type VARCHAR(64) DEFAULT '',
+                        side VARCHAR(32) DEFAULT '',
+                        price DOUBLE PRECISION DEFAULT 0,
+                        amount DOUBLE PRECISION DEFAULT 0,
+                        profit DOUBLE PRECISION DEFAULT 0,
+                        balance DOUBLE PRECISION DEFAULT 0,
+                        reason VARCHAR(64) DEFAULT '',
+                        payload_json TEXT DEFAULT '',
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id ON qd_backtest_trades(run_id)")
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS qd_backtest_equity_points (
+                        id SERIAL PRIMARY KEY,
+                        run_id INTEGER NOT NULL,
+                        point_index INTEGER DEFAULT 0,
+                        point_time VARCHAR(64) DEFAULT '',
+                        point_value DOUBLE PRECISION DEFAULT 0,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                    """
+                )
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_backtest_equity_points_run_id ON qd_backtest_equity_points(run_id)")
+                db.commit()
+                cur.close()
+            self._storage_schema_ready = True
+        except Exception:
+            logger.warning("Failed to ensure backtest storage schema", exc_info=True)
+
+    def _detect_trade_side(self, trade_type: str) -> str:
+        ty = str(trade_type or '').strip().lower()
+        if 'long' in ty:
+            return 'long'
+        if 'short' in ty:
+            return 'short'
+        return ''
     
     @staticmethod
     def _infer_candle_path(open_: float, high: float, low: float, close: float) -> List[float]:
@@ -79,7 +192,7 @@ class BacktestService:
             }
         
         if days_diff <= self.MTF_CONFIG['max_1m_days']:
-            # Within 1 month: use 1-minute precision
+            # Within 15 days: use 1-minute precision
             estimated_candles = days_diff * 24 * 60
             return '1m', {
                 'enabled': True,
@@ -90,7 +203,7 @@ class BacktestService:
                 'message': f'Using 1-minute precision backtest (~{estimated_candles:,} candles)'
             }
         elif days_diff <= self.MTF_CONFIG['max_5m_days']:
-            # 1 month to 1 year: use 5-minute precision
+            # 15 days to 1 year: use 5-minute precision
             estimated_candles = days_diff * 24 * 12
             return '5m', {
                 'enabled': True,
@@ -98,7 +211,7 @@ class BacktestService:
                 'days': days_diff,
                 'estimated_candles': estimated_candles,
                 'precision': 'medium',
-                'message': f'Range exceeds 30 days, using 5-minute precision (~{estimated_candles:,} candles)'
+                'message': f'Range exceeds {self.MTF_CONFIG["max_1m_days"]} days, using 5-minute precision (~{estimated_candles:,} candles)'
             }
         else:
             # Over 1 year: high-precision backtest not supported
@@ -109,6 +222,224 @@ class BacktestService:
                 'max_days': self.MTF_CONFIG['max_5m_days'],
                 'message': f'Backtest range {days_diff} days exceeds max limit {self.MTF_CONFIG["max_5m_days"]} days'
             }
+
+    def _liquidation_loss(self, capital: Any) -> float:
+        try:
+            equity = max(0.0, float(capital or 0.0))
+        except Exception:
+            equity = 0.0
+        return round(-equity, 2)
+
+    def persist_run(
+        self,
+        *,
+        user_id: int,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        start_date_str: str,
+        end_date_str: str,
+        initial_capital: float,
+        commission: float,
+        slippage: float,
+        leverage: int,
+        trade_direction: str,
+        strategy_config: Optional[Dict[str, Any]] = None,
+        config_snapshot: Optional[Dict[str, Any]] = None,
+        status: str = 'success',
+        error_message: str = '',
+        result: Optional[Dict[str, Any]] = None,
+        indicator_id: Optional[int] = None,
+        strategy_id: Optional[int] = None,
+        strategy_name: str = '',
+        run_type: str = 'indicator',
+        code: str = '',
+    ) -> Optional[int]:
+        self.ensure_storage_schema()
+        run_id = None
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO qd_backtest_runs
+                    (user_id, indicator_id, strategy_id, strategy_name, run_type, market, symbol, timeframe,
+                     start_date, end_date, initial_capital, commission, slippage, leverage, trade_direction,
+                     strategy_config, config_snapshot, engine_version, code_hash, status, error_message, result_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                    """,
+                    (
+                        int(user_id or 1),
+                        int(indicator_id) if indicator_id is not None else None,
+                        int(strategy_id) if strategy_id is not None else None,
+                        str(strategy_name or ''),
+                        str(run_type or 'indicator'),
+                        str(market or ''),
+                        str(symbol or ''),
+                        str(timeframe or ''),
+                        str(start_date_str or ''),
+                        str(end_date_str or ''),
+                        float(initial_capital or 0),
+                        float(commission or 0),
+                        float(slippage or 0),
+                        int(leverage or 1),
+                        str(trade_direction or 'long'),
+                        json.dumps(strategy_config or {}, ensure_ascii=False),
+                        json.dumps(config_snapshot or {}, ensure_ascii=False),
+                        self.ENGINE_VERSION,
+                        hashlib.sha256(str(code or '').encode('utf-8')).hexdigest() if code else '',
+                        str(status or 'success'),
+                        str(error_message or ''),
+                        json.dumps(result or {}, ensure_ascii=False) if result else ''
+                    )
+                )
+                run_id = cur.lastrowid
+
+                if run_id and status == 'success' and isinstance(result, dict):
+                    for idx, trade in enumerate((result.get('trades') or []), start=1):
+                        cur.execute(
+                            """
+                            INSERT INTO qd_backtest_trades
+                            (run_id, user_id, strategy_id, trade_index, trade_time, trade_type, side, price, amount, profit, balance, reason, payload_json, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+                            """,
+                            (
+                                int(run_id),
+                                int(user_id or 1),
+                                int(strategy_id) if strategy_id is not None else None,
+                                idx,
+                                str(trade.get('time') or ''),
+                                str(trade.get('type') or ''),
+                                self._detect_trade_side(trade.get('type')),
+                                float(trade.get('price') or 0),
+                                float(trade.get('amount') or 0),
+                                float(trade.get('profit') or 0),
+                                float(trade.get('balance') or 0),
+                                str(trade.get('reason') or trade.get('close_reason') or ''),
+                                json.dumps(trade or {}, ensure_ascii=False),
+                            )
+                        )
+
+                    for idx, point in enumerate((result.get('equityCurve') or []), start=1):
+                        cur.execute(
+                            """
+                            INSERT INTO qd_backtest_equity_points
+                            (run_id, point_index, point_time, point_value, created_at)
+                            VALUES (?, ?, ?, ?, NOW())
+                            """,
+                            (
+                                int(run_id),
+                                idx,
+                                str(point.get('time') or ''),
+                                float(point.get('value') or 0),
+                            )
+                        )
+
+                db.commit()
+                cur.close()
+        except Exception:
+            logger.warning("Failed to persist backtest run", exc_info=True)
+        return run_id
+
+    def list_runs(
+        self,
+        *,
+        user_id: int,
+        limit: int = 50,
+        offset: int = 0,
+        indicator_id: Optional[int] = None,
+        strategy_id: Optional[int] = None,
+        run_type: Optional[str] = None,
+        symbol: str = '',
+        market: str = '',
+        timeframe: str = '',
+    ) -> List[Dict[str, Any]]:
+        self.ensure_storage_schema()
+        where = ["user_id = ?"]
+        params: List[Any] = [int(user_id or 1)]
+        if indicator_id is not None:
+            where.append("indicator_id = ?")
+            params.append(int(indicator_id))
+        if strategy_id is not None:
+            where.append("strategy_id = ?")
+            params.append(int(strategy_id))
+        if run_type:
+            where.append("run_type = ?")
+            params.append(str(run_type))
+        if symbol:
+            where.append("symbol = ?")
+            params.append(str(symbol))
+        if market:
+            where.append("market = ?")
+            params.append(str(market))
+        if timeframe:
+            where.append("timeframe = ?")
+            params.append(str(timeframe))
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                f"""
+                SELECT id, user_id, indicator_id, strategy_id, strategy_name, run_type, market, symbol, timeframe,
+                       start_date, end_date, initial_capital, commission, slippage, leverage, trade_direction,
+                       strategy_config, config_snapshot, engine_version, code_hash, status, error_message,
+                       result_json, created_at
+                FROM qd_backtest_runs
+                WHERE {" AND ".join(where)}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (*params, int(limit), int(offset)),
+            )
+            rows = cur.fetchall() or []
+            cur.close()
+
+        return [self._hydrate_run_row(r, include_result=False) for r in rows]
+
+    def get_run(self, *, user_id: int, run_id: int) -> Optional[Dict[str, Any]]:
+        self.ensure_storage_schema()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT id, user_id, indicator_id, strategy_id, strategy_name, run_type, market, symbol, timeframe,
+                       start_date, end_date, initial_capital, commission, slippage, leverage, trade_direction,
+                       strategy_config, config_snapshot, engine_version, code_hash, status, error_message,
+                       result_json, created_at
+                FROM qd_backtest_runs
+                WHERE id = ? AND user_id = ?
+                """,
+                (int(run_id), int(user_id or 1)),
+            )
+            row = cur.fetchone()
+            cur.close()
+        if not row:
+            return None
+        return self._hydrate_run_row(row, include_result=True)
+
+    def _hydrate_run_row(self, row: Dict[str, Any], include_result: bool = True) -> Dict[str, Any]:
+        item = dict(row or {})
+        try:
+            item['strategy_config'] = json.loads(item.get('strategy_config') or '{}')
+        except Exception:
+            item['strategy_config'] = {}
+        try:
+            item['config_snapshot'] = json.loads(item.get('config_snapshot') or '{}')
+        except Exception:
+            item['config_snapshot'] = {}
+        try:
+            result = json.loads(item.get('result_json') or '{}')
+        except Exception:
+            result = {}
+
+        item['total_return'] = result.get('totalReturn')
+        item['annual_return'] = result.get('annualReturn')
+        item['win_rate'] = result.get('winRate')
+        item['total_trades'] = result.get('totalTrades')
+        if include_result:
+            item['result'] = result
+        item.pop('result_json', None)
+        return item
     
     def run_multi_timeframe(
         self,
@@ -124,7 +455,10 @@ class BacktestService:
         leverage: int = 1,
         trade_direction: str = 'long',
         strategy_config: Optional[Dict[str, Any]] = None,
-        enable_mtf: bool = True
+        enable_mtf: bool = True,
+        indicator_params: Optional[Dict[str, Any]] = None,
+        user_id: int = 1,
+        indicator_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Multi-timeframe backtest.
@@ -152,9 +486,36 @@ class BacktestService:
         """
         # Get execution timeframe
         exec_tf, precision_info = self.get_execution_timeframe(start_date, end_date, market)
+        cfg = strategy_config or {}
+        exec_cfg = cfg.get('execution') or {}
+        scale_cfg = cfg.get('scale') or {}
+        signal_timing = str(exec_cfg.get('signalTiming') or 'next_bar_open').strip().lower()
+        enabled_scale_keys = ['trendAdd', 'dcaAdd', 'trendReduce', 'adverseReduce']
+        has_scale_rules = any(bool((scale_cfg.get(key) or {}).get('enabled')) for key in enabled_scale_keys)
         
-        if not enable_mtf or not precision_info.get('enabled'):
-            # Fallback to standard candle backtest
+        # Skip MTF when: disabled, not supported, or signal tf <= exec tf (no precision gain)
+        signal_tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
+        exec_tf_seconds = self.TIMEFRAME_SECONDS.get(exec_tf, 300) if exec_tf else signal_tf_seconds
+        skip_mtf = (
+            not enable_mtf
+            or not precision_info.get('enabled')
+            or signal_tf_seconds <= exec_tf_seconds
+            or has_scale_rules
+            or signal_timing not in ['next_bar_open', 'next_open', 'nextopen', 'next']
+        )
+        
+        if skip_mtf:
+            fallback_reason = None
+            if has_scale_rules:
+                fallback_reason = 'scale_rules_not_supported_in_mtf'
+            elif signal_timing not in ['next_bar_open', 'next_open', 'nextopen', 'next']:
+                fallback_reason = 'signal_timing_not_supported_in_mtf'
+            elif signal_tf_seconds <= exec_tf_seconds:
+                fallback_reason = 'no_precision_gain'
+            logger.info(
+                f"Using standard backtest: tf={timeframe} "
+                f"(MTF skipped, reason={fallback_reason}, signal_tf_s={signal_tf_seconds}, exec_tf_s={exec_tf_seconds})"
+            )
             result = self.run(
                 indicator_code=indicator_code,
                 market=market,
@@ -167,7 +528,10 @@ class BacktestService:
                 slippage=slippage,
                 leverage=leverage,
                 trade_direction=trade_direction,
-                strategy_config=strategy_config
+                strategy_config=strategy_config,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
             )
             result['precision_info'] = precision_info or {
                 'enabled': False,
@@ -175,6 +539,18 @@ class BacktestService:
                 'precision': 'standard',
                 'message': 'Using standard candle backtest'
             }
+            if fallback_reason:
+                result['precision_info']['fallback_reason'] = fallback_reason
+                if fallback_reason == 'scale_rules_not_supported_in_mtf':
+                    result['precision_info']['message'] = 'Using standard backtest because scale rules are not fully supported in MTF mode'
+                elif fallback_reason == 'signal_timing_not_supported_in_mtf':
+                    result['precision_info']['message'] = 'Using standard backtest because this execution timing is not fully supported in MTF mode'
+            ea = result.get('executionAssumptions') or {}
+            ea['mtfRequested'] = bool(enable_mtf)
+            ea['mtfActive'] = False
+            if fallback_reason:
+                ea['mtfFallbackReason'] = fallback_reason
+            result['executionAssumptions'] = ea
             return result
         
         logger.info(f"Multi-timeframe backtest: strategy_tf={timeframe}, exec_tf={exec_tf}, range={start_date} ~ {end_date}")
@@ -189,12 +565,18 @@ class BacktestService:
             'leverage': leverage,
             'initial_capital': initial_capital,
             'commission': commission,
-            'trade_direction': trade_direction
+            'trade_direction': trade_direction,
+            'indicator_params': indicator_params or {},
+            'user_id': user_id,
+            'indicator_id': indicator_id,
         }
         signals = self._execute_indicator(indicator_code, df_signal, backtest_params)
+        logger.info(f"Signals generated: {list(signals.keys()) if isinstance(signals, dict) else type(signals)}")
         
         # 3. Fetch execution timeframe candles (for precise trade simulation)
+        logger.info(f"Fetching execution timeframe data: {exec_tf} for {market}:{symbol}")
         df_exec = self._fetch_kline_data(market, symbol, exec_tf, start_date, end_date)
+        logger.info(f"Execution timeframe data fetched: {len(df_exec)} candles")
         if df_exec.empty:
             logger.warning(f"Cannot fetch {exec_tf} candles, falling back to standard backtest")
             result = self.run(
@@ -209,19 +591,29 @@ class BacktestService:
                 slippage=slippage,
                 leverage=leverage,
                 trade_direction=trade_direction,
-                strategy_config=strategy_config
+                strategy_config=strategy_config,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
             )
             result['precision_info'] = {
                 'enabled': False,
                 'reason': 'data_unavailable',
                 'message': f'Cannot fetch {exec_tf} data, using standard backtest'
             }
+            ea = result.get('executionAssumptions') or {}
+            ea['mtfRequested'] = bool(enable_mtf)
+            ea['mtfActive'] = False
+            ea['mtfFallbackReason'] = 'data_unavailable'
+            result['executionAssumptions'] = ea
             return result
         
         logger.info(f"Data fetched: signal_candles={len(df_signal)}, exec_candles={len(df_exec)}")
         
         # 4. Use execution timeframe for precise trade simulation
-        equity_curve, trades, total_commission = self._simulate_trading_mtf(
+        try:
+            logger.info("Starting MTF trading simulation...")
+            equity_curve, trades, total_commission = self._simulate_trading_mtf(
             df_signal=df_signal,
             df_exec=df_exec,
             signals=signals,
@@ -231,19 +623,46 @@ class BacktestService:
             leverage=leverage,
             trade_direction=trade_direction,
             strategy_config=strategy_config,
-            signal_timeframe=timeframe,
-            exec_timeframe=exec_tf
-        )
+                signal_timeframe=timeframe,
+                exec_timeframe=exec_tf
+            )
+            logger.info(f"MTF simulation completed: {len(trades)} trades executed")
+        except Exception as e:
+            logger.error(f"MTF simulation failed: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         
         # 5. Calculate metrics
-        metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
+        try:
+            logger.info(f"Calculating metrics: equity_curve_len={len(equity_curve)}, trades_len={len(trades)}, initial_capital={initial_capital}")
+            metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
+            logger.info(f"Metrics calculated successfully: {list(metrics.keys())}")
+        except Exception as e:
+            logger.error(f"Failed to calculate metrics: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         
         # 6. Format result
-        result = self._format_result(metrics, equity_curve, trades)
-        result['precision_info'] = precision_info
-        result['execution_timeframe'] = exec_tf
-        result['signal_candles'] = len(df_signal)
-        result['execution_candles'] = len(df_exec)
+        try:
+            logger.info("Formatting backtest result...")
+            result = self._format_result(metrics, equity_curve, trades)
+            result['precision_info'] = precision_info
+            result['execution_timeframe'] = exec_tf
+            result['signal_candles'] = len(df_signal)
+            result['execution_candles'] = len(df_exec)
+            result['executionAssumptions'] = self._execution_assumptions(
+                strategy_config,
+                simulation_mode='mtf',
+                signal_timeframe=timeframe,
+                execution_timeframe=exec_tf,
+                mtf_requested=True,
+                mtf_active=True,
+            )
+            logger.info("Backtest result formatted successfully")
+        except Exception as e:
+            logger.error(f"Failed to format result: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise
         
         return result
     
@@ -267,6 +686,11 @@ class BacktestService:
         Simulates trades candle by candle on execution timeframe, 
         using inferred candle price path to determine trigger order.
         """
+        try:
+            logger.info(f"Entering _simulate_trading_mtf: df_signal={len(df_signal)}, df_exec={len(df_exec)}, signals_type={type(signals)}")
+        except Exception as e:
+            logger.error(f"Error in _simulate_trading_mtf entry logging: {e}")
+        
         equity_curve = []
         trades = []
         total_commission_paid = 0.0
@@ -342,19 +766,38 @@ class BacktestService:
             norm_signals = signals
             norm_signals['_both_mode'] = False  # Explicit 4-signal mode, not both mode
         elif all(k in signals for k in ['buy', 'sell']):
-            buy = signals['buy'].fillna(False).astype(bool)
-            sell = signals['sell'].fillna(False).astype(bool)
+            # Ensure signals have the same index as df_signal
+            buy_series = signals['buy']
+            sell_series = signals['sell']
+            
+            # Reindex to match df_signal.index (fill missing with False)
+            if not buy_series.index.equals(df_signal.index):
+                logger.warning(f"Buy signal index mismatch! Signal index: {buy_series.index[:5].tolist()}, df_signal index: {df_signal.index[:5].tolist()}")
+                buy_series = buy_series.reindex(df_signal.index, fill_value=False)
+            if not sell_series.index.equals(df_signal.index):
+                logger.warning(f"Sell signal index mismatch! Signal index: {sell_series.index[:5].tolist()}, df_signal index: {df_signal.index[:5].tolist()}")
+                sell_series = sell_series.reindex(df_signal.index, fill_value=False)
+            
+            buy = buy_series.fillna(False).astype(bool)
+            sell = sell_series.fillna(False).astype(bool)
+            
+            # Debug: log signal statistics
+            buy_count = buy.sum()
+            sell_count = sell.sum()
+            logger.info(f"Signal statistics: buy={buy_count}, sell={sell_count}, total_candles={len(df_signal)}")
+            
             td = str(trade_direction or 'both').lower()
+            logger.info(f"Trade direction: {td} (original: {trade_direction})")
             if td == 'long':
                 norm_signals = {
                     'open_long': buy, 'close_long': sell,
-                    'open_short': pd.Series([False] * len(df_signal), index=df_signal.index),
-                    'close_short': pd.Series([False] * len(df_signal), index=df_signal.index),
+                    'open_short': pd.Series([False] * len(df_signal), index=df_signal.index, dtype=bool),
+                    'close_short': pd.Series([False] * len(df_signal), index=df_signal.index, dtype=bool),
                 }
             elif td == 'short':
                 norm_signals = {
-                    'open_long': pd.Series([False] * len(df_signal), index=df_signal.index),
-                    'close_long': pd.Series([False] * len(df_signal), index=df_signal.index),
+                    'open_long': pd.Series([False] * len(df_signal), index=df_signal.index, dtype=bool),
+                    'close_long': pd.Series([False] * len(df_signal), index=df_signal.index, dtype=bool),
                     'open_short': sell, 'close_short': buy,
                 }
             else:
@@ -363,12 +806,14 @@ class BacktestService:
                 # We use special signal types 'enter_long' and 'enter_short' to indicate
                 # that the signal should auto-close opposing position before opening
                 norm_signals = {
-                    'open_long': buy, 'close_long': pd.Series([False] * len(df_signal), index=df_signal.index),
-                    'open_short': sell, 'close_short': pd.Series([False] * len(df_signal), index=df_signal.index),
+                    'open_long': buy, 'close_long': pd.Series([False] * len(df_signal), index=df_signal.index, dtype=bool),
+                    'open_short': sell, 'close_short': pd.Series([False] * len(df_signal), index=df_signal.index, dtype=bool),
                     '_both_mode': True  # Flag to indicate both mode for special handling
                 }
         else:
             raise ValueError("Invalid signal format")
+        
+        logger.info("Signal normalization completed, starting signal queue building...")
         
         # Map signals to execution timeframe
         # Strategy timeframe seconds (e.g. 1H=3600, 1D=86400)
@@ -379,24 +824,38 @@ class BacktestService:
         
         # Preprocessing: create signal queue sorted by effective time
         # Each signal executes at the open of the next execution candle after its candle closes
+        logger.info("Initializing signal queue...")
         signal_queue = []  # [(effective_time, signal_type, signal_bar_time), ...]
         
         # Debug: check signal values
         debug_signal_counts = {'open_long': 0, 'close_long': 0, 'open_short': 0, 'close_short': 0}
+        
+        # Verify all norm_signals have matching index
+        for sig_type in ['open_long', 'close_long', 'open_short', 'close_short']:
+            if not norm_signals[sig_type].index.equals(df_signal.index):
+                logger.error(f"Critical: {sig_type} signal index does not match df_signal.index!")
+                logger.error(f"  Signal index: {norm_signals[sig_type].index[:5].tolist()}")
+                logger.error(f"  df_signal index: {df_signal.index[:5].tolist()}")
+                # Reindex to fix
+                norm_signals[sig_type] = norm_signals[sig_type].reindex(df_signal.index, fill_value=False)
+                logger.warning(f"  Fixed by reindexing {sig_type}")
         
         for sig_time in df_signal.index:
             # Signal candle end time = start time + period
             sig_end = sig_time + timedelta(seconds=signal_tf_seconds)
             
             # Check if this signal candle has signals
-            # Use .loc[] instead of .get() to be more explicit
+            # All signals should now have matching index, so we can safely use .loc[]
             try:
-                ol = bool(norm_signals['open_long'].loc[sig_time]) if sig_time in norm_signals['open_long'].index else False
-                cl = bool(norm_signals['close_long'].loc[sig_time]) if sig_time in norm_signals['close_long'].index else False
-                os = bool(norm_signals['open_short'].loc[sig_time]) if sig_time in norm_signals['open_short'].index else False
-                cs = bool(norm_signals['close_short'].loc[sig_time]) if sig_time in norm_signals['close_short'].index else False
+                ol = bool(norm_signals['open_long'].loc[sig_time])
+                cl = bool(norm_signals['close_long'].loc[sig_time])
+                os = bool(norm_signals['open_short'].loc[sig_time])
+                cs = bool(norm_signals['close_short'].loc[sig_time])
+            except (KeyError, IndexError) as e:
+                logger.warning(f"Error accessing signal at {sig_time}: {e}, signal index: {norm_signals['open_long'].index[:5].tolist()}, df_signal index: {df_signal.index[:5].tolist()}")
+                continue
             except Exception as e:
-                logger.warning(f"Error accessing signal at {sig_time}: {e}")
+                logger.warning(f"Unexpected error accessing signal at {sig_time}: {e}")
                 continue
             
             if ol:
@@ -414,6 +873,22 @@ class BacktestService:
         
         logger.info(f"Debug signal counts from queue building: {debug_signal_counts}")
         
+        # If no signals found, log detailed diagnostic info
+        if len(signal_queue) == 0:
+            logger.warning("No signals found in signal queue! Diagnostic info:")
+            logger.warning(f"  df_signal length: {len(df_signal)}")
+            logger.warning(f"  df_signal index range: {df_signal.index[0]} to {df_signal.index[-1]}")
+            for sig_type in ['open_long', 'close_long', 'open_short', 'close_short']:
+                sig_series = norm_signals[sig_type]
+                true_count = sig_series.sum()
+                logger.warning(f"  {sig_type}: {true_count} True values out of {len(sig_series)}")
+                if true_count > 0:
+                    true_indices = sig_series[sig_series].index.tolist()[:5]
+                    logger.warning(f"    First few True indices: {true_indices}")
+            # Check if signals might be in wrong format
+            if 'buy' in signals or 'sell' in signals:
+                logger.warning("  Original signals had 'buy'/'sell' keys - check if conversion was correct")
+        
         # Sort by effective time
         signal_queue.sort(key=lambda x: x[0])
         signal_queue_idx = 0  # Current signal queue pointer
@@ -422,12 +897,20 @@ class BacktestService:
         if signal_queue:
             logger.info(f"First signal: {signal_queue[0][1]} @ {signal_queue[0][0]} (from {signal_queue[0][2]})")
             logger.info(f"Last signal: {signal_queue[-1][1]} @ {signal_queue[-1][0]} (from {signal_queue[-1][2]})")
+        else:
+            logger.error("Signal queue is empty! Backtest will fail. Check indicator code to ensure it generates buy/sell signals.")
         
         # Count signals by type
         signal_counts = {}
         for _, sig_type, _ in signal_queue:
             signal_counts[sig_type] = signal_counts.get(sig_type, 0) + 1
         logger.info(f"Signal counts: {signal_counts}")
+        
+        # Log first few signal details for debugging
+        if signal_queue:
+            logger.info(f"First 3 signals details:")
+            for idx, (sig_time, sig_type, sig_bar_time) in enumerate(signal_queue[:3]):
+                logger.info(f"  Signal {idx+1}: {sig_type} @ effective_time={sig_time}, from_bar={sig_bar_time}")
         
         # Log execution data range
         if len(df_exec) > 0:
@@ -443,7 +926,17 @@ class BacktestService:
         pending_signal_time = None  # Signal effective time
         executed_trades_count = 0  # Debug counter
         
+        # Progress logging for large datasets
+        total_exec_candles = len(df_exec)
+        progress_log_interval = max(1000, total_exec_candles // 10)  # Log every 10% or every 1000 candles
+        
+        logger.info(f"Starting execution loop: {total_exec_candles} candles to process, {len(signal_queue)} signals in queue")
+        
         for i, (timestamp, row) in enumerate(df_exec.iterrows()):
+            # Progress logging
+            if i > 0 and i % progress_log_interval == 0:
+                progress_pct = (i / total_exec_candles) * 100
+                logger.info(f"Execution progress: {i}/{total_exec_candles} ({progress_pct:.1f}%), trades={executed_trades_count}, position={position}")
             # 爆仓后直接停止回测，输出结果
             if is_liquidated:
                 break
@@ -500,13 +993,10 @@ class BacktestService:
                         pending_signal = sig_type
                         pending_signal_time = sig_effective_time
                         signal_queue_idx += 1
-                        if executed_trades_count < 5:
-                            logger.info(f"Signal ready: {sig_type} @ {timestamp}, will execute at open price (both_mode={both_mode_active})")
+                        if executed_trades_count < 3:
+                            logger.info(f"Signal ready: {sig_type} @ {timestamp} (effective_time={sig_effective_time})")
                         break
                     else:
-                        # Signal doesn't meet execution conditions, skip
-                        if signal_queue_idx < 5:
-                            logger.info(f"Skipping signal #{signal_queue_idx}: {sig_type} (position={position}, can_execute=False)")
                         signal_queue_idx += 1
                         continue
                 else:
@@ -617,6 +1107,7 @@ class BacktestService:
                                 commission_fee = shares * exec_price * commission
                                 profit = (entry_price - exec_price) * shares - commission_fee
                                 if capital + profit <= 0:
+                                    liquidation_loss = self._liquidation_loss(capital)
                                     capital = 0
                                     is_liquidated = True
                                     trades.append({
@@ -624,7 +1115,7 @@ class BacktestService:
                                         'type': 'liquidation',
                                         'price': round(exec_price, 4),
                                         'amount': round(shares, 4),
-                                        'profit': round(-initial_capital, 2),
+                                        'profit': liquidation_loss,
                                         'balance': 0
                                     })
                                 else:
@@ -656,6 +1147,7 @@ class BacktestService:
                                     commission_fee = shares * exec_price * commission
                                     profit = (entry_price - exec_price) * shares - commission_fee
                                     if capital + profit <= 0:
+                                        liquidation_loss = self._liquidation_loss(capital)
                                         capital = 0
                                         is_liquidated = True
                                         trades.append({
@@ -663,7 +1155,7 @@ class BacktestService:
                                             'type': 'liquidation',
                                             'price': round(exec_price, 4),
                                             'amount': round(shares, 4),
-                                            'profit': round(-initial_capital, 2),
+                                            'profit': liquidation_loss,
                                             'balance': 0
                                         })
                                     else:
@@ -713,6 +1205,8 @@ class BacktestService:
                 # 2. Execute pending signal (at open price)
                 if pending_signal and path_price == open_:
                     both_mode_active = norm_signals.get('_both_mode', False)
+                    if executed_trades_count < 10:
+                        logger.info(f"Executing pending signal: {pending_signal} @ {timestamp}, path_price={path_price}, open={open_}, position={position}")
                     
                     # open_long: In both mode, first close short if any, then open long
                     if pending_signal == 'open_long' and (position == 0 or (both_mode_active and position < 0)):
@@ -909,11 +1403,156 @@ class BacktestService:
             })
         
         # Summary log
-        logger.info(f"MTF simulation complete: executed_trades={executed_trades_count}, total_trades_recorded={len(trades)}, final_capital={capital:.2f}")
+        logger.info(f"MTF simulation complete: executed_trades={executed_trades_count}, total_trades_recorded={len(trades)}, final_capital={capital:.2f}, final_position={position}")
         if len(trades) == 0:
-            logger.warning(f"No trades executed! signal_queue_idx={signal_queue_idx}, total_signals={len(signal_queue)}")
+            if len(signal_queue) == 0:
+                logger.error(f"No trades executed because signal queue is empty! This usually means:")
+                logger.error("  1. Indicator code did not generate any buy/sell signals")
+                logger.error("  2. Signal index mismatch between indicator output and df_signal")
+                logger.error("  3. All signal values are False")
+                raise ValueError("No signals generated by indicator code. Please check your indicator code to ensure it sets df['buy'] and/or df['sell'] columns with boolean values.")
+            else:
+                logger.error(f"No trades executed despite {len(signal_queue)} signals in queue. signal_queue_idx={signal_queue_idx}")
+                logger.error(f"  Signal queue processed: {signal_queue_idx}/{len(signal_queue)}")
+                logger.error(f"  Final position: {position}, Final capital: {capital:.2f}")
+                logger.error("  This may indicate:")
+                logger.error("    1. Signal timing issues (signal effective time doesn't match execution timeframe)")
+                logger.error("    2. Position state conflicts (signals skipped due to position state)")
+                logger.error("    3. Capital insufficient for trading")
+                logger.error(f"  First few signals: {signal_queue[:min(5, len(signal_queue))]}")
+                logger.error(f"  Exec data range: {df_exec.index[0]} to {df_exec.index[-1]}")
+                raise ValueError(f"No trades executed despite {len(signal_queue)} signals. Check signal timing and position state logic.")
         
         return equity_curve, trades, total_commission_paid
+
+    def run_strategy_snapshot(
+        self,
+        snapshot: Dict[str, Any],
+        start_date: datetime,
+        end_date: datetime,
+    ) -> Dict[str, Any]:
+        if not snapshot:
+            raise ValueError("strategy snapshot is required")
+
+        code = snapshot.get('code') or ''
+        market = snapshot.get('market') or 'Crypto'
+        symbol = snapshot.get('symbol') or ''
+        timeframe = snapshot.get('timeframe') or '1D'
+        initial_capital = float(snapshot.get('initial_capital') or 10000)
+        commission = float(snapshot.get('commission') or 0)
+        slippage = float(snapshot.get('slippage') or 0)
+        leverage = int(snapshot.get('leverage') or 1)
+        trade_direction = str(snapshot.get('trade_direction') or 'long')
+        strategy_config = snapshot.get('strategy_config') or {}
+        indicator_params = snapshot.get('indicator_params') or {}
+        indicator_id = snapshot.get('indicator_id')
+        user_id = int(snapshot.get('user_id') or 1)
+        run_type = str(snapshot.get('run_type') or 'strategy_indicator')
+
+        if run_type == 'strategy_script':
+            return self._run_script_strategy(
+                code=code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=strategy_config,
+            )
+
+        if bool(snapshot.get('enable_mtf')) and str(market).lower() in ['crypto', 'cryptocurrency']:
+            result = self.run_multi_timeframe(
+                indicator_code=code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=strategy_config,
+                enable_mtf=True,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
+            )
+        else:
+            result = self.run(
+                indicator_code=code,
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date=start_date,
+                end_date=end_date,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=strategy_config,
+                indicator_params=indicator_params,
+                user_id=user_id,
+                indicator_id=indicator_id,
+            )
+            result['precision_info'] = {
+                'enabled': False,
+                'timeframe': timeframe,
+                'precision': 'standard',
+                'message': 'Using standard strategy backtest'
+            }
+        return result
+
+    def _run_script_strategy(
+        self,
+        *,
+        code: str,
+        market: str,
+        symbol: str,
+        timeframe: str,
+        start_date: datetime,
+        end_date: datetime,
+        initial_capital: float,
+        commission: float,
+        slippage: float,
+        leverage: int,
+        trade_direction: str,
+        strategy_config: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        df = self._fetch_kline_data(market, symbol, timeframe, start_date, end_date)
+        if df.empty:
+            raise ValueError("No candle data available in the backtest date range")
+
+        signals = self._execute_script_strategy(code, df, {
+            'initial_capital': initial_capital,
+            'leverage': leverage,
+            'trade_direction': trade_direction,
+            'strategy_config': strategy_config or {},
+        })
+        equity_curve, trades, total_commission = self._simulate_trading(
+            df, signals, initial_capital, commission, slippage, leverage, trade_direction, strategy_config
+        )
+        metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
+        result = self._format_result(metrics, equity_curve, trades)
+        result['precision_info'] = {
+            'enabled': False,
+            'timeframe': timeframe,
+            'precision': 'standard',
+            'message': 'Using standard strategy script backtest'
+        }
+        result['executionAssumptions'] = self._execution_assumptions(
+            strategy_config,
+            simulation_mode='standard',
+            signal_timeframe=timeframe,
+        )
+        return result
     
     def run_code_strategy(
         self,
@@ -945,26 +1584,23 @@ class BacktestService:
             'output': {}  # Default empty output
         }
         
-        # 4. Execute code
+        # 4. Execute code (with validation + sandbox)
         try:
-            import builtins
-            def safe_import(name, *args, **kwargs):
-                allowed = ['numpy', 'pandas', 'math', 'json', 'datetime', 'time']
-                if name in allowed or name.split('.')[0] in allowed:
-                    return builtins.__import__(name, *args, **kwargs)
-                raise ImportError(f"Import not allowed: {name}")
-            
-            safe_builtins = {k: getattr(builtins, k) for k in dir(builtins) 
-                           if not k.startswith('_') and k not in ['eval', 'exec', 'compile', 'open', 'input', 'exit']}
-            safe_builtins['__import__'] = safe_import
-            
+            from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
             exec_env = local_vars.copy()
-            exec_env['__builtins__'] = safe_builtins
-            
-            exec(code, exec_env)
-            
+            exec_env['__builtins__'] = build_safe_builtins()
+
+            exec_result = safe_exec_with_validation(
+                code=code,
+                exec_globals=exec_env,
+                timeout=60,
+            )
+            if not exec_result['success']:
+                return {"error": exec_result['error']}
+
             return exec_env.get('output', {})
-            
+
         except Exception as e:
             logger.error(f"Strategy execution failed: {e}")
             logger.error(traceback.format_exc())
@@ -983,7 +1619,10 @@ class BacktestService:
         slippage: float = 0.0,  # Ideal backtest environment, no slippage
         leverage: int = 1,
         trade_direction: str = 'long',
-        strategy_config: Optional[Dict[str, Any]] = None
+        strategy_config: Optional[Dict[str, Any]] = None,
+        indicator_params: Optional[Dict[str, Any]] = None,
+        user_id: int = 1,
+        indicator_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Run backtest.
@@ -1014,7 +1653,10 @@ class BacktestService:
             'leverage': leverage,
             'initial_capital': initial_capital,
             'commission': commission,
-            'trade_direction': trade_direction
+            'trade_direction': trade_direction,
+            'indicator_params': indicator_params or {},
+            'user_id': user_id,
+            'indicator_id': indicator_id,
         }
         signals = self._execute_indicator(indicator_code, df, backtest_params)
         
@@ -1027,7 +1669,13 @@ class BacktestService:
         metrics = self._calculate_metrics(equity_curve, trades, initial_capital, timeframe, start_date, end_date, total_commission)
         
         # 5. Format result
-        return self._format_result(metrics, equity_curve, trades)
+        result = self._format_result(metrics, equity_curve, trades)
+        result['executionAssumptions'] = self._execution_assumptions(
+            strategy_config,
+            simulation_mode='standard',
+            signal_timeframe=timeframe,
+        )
+        return result
     
     def _fetch_kline_data(
         self,
@@ -1037,7 +1685,7 @@ class BacktestService:
         start_date: datetime,
         end_date: datetime
     ) -> pd.DataFrame:
-        """Fetch candle data and convert to DataFrame"""
+        """Fetch candle data and convert to DataFrame (with in-memory caching)"""
         # Calculate required candle count
         total_seconds = (end_date - start_date).total_seconds()
         tf_seconds = self.TIMEFRAME_SECONDS.get(timeframe, 86400)
@@ -1045,7 +1693,12 @@ class BacktestService:
         
         # Calculate before_time (end date + 1 day)
         before_time = int((end_date + timedelta(days=1)).timestamp())
-        
+
+        cache_key = f"{market}:{symbol}:{timeframe}:{start_date.date()}:{end_date.date()}"
+        cached = _kline_cache.get(cache_key)
+        if cached is not None and not cached.empty:
+            logger.info(f"K-line cache HIT for {cache_key} ({len(cached)} candles)")
+            return cached
         
         # Fetch data
         kline_data = DataSourceFactory.get_kline(
@@ -1057,28 +1710,91 @@ class BacktestService:
         )
         
         if not kline_data:
-            logger.warning("No candle data retrieved")
+            logger.warning(f"No candle data retrieved for {market}:{symbol}, timeframe={timeframe}, limit={limit}, before_time={before_time}")
             return pd.DataFrame()
         
-        if kline_data:
-            first_time = datetime.fromtimestamp(kline_data[0]['time'])
-            last_time = datetime.fromtimestamp(kline_data[-1]['time'])
+        logger.info(f"Retrieved {len(kline_data)} candles for {market}:{symbol}, timeframe={timeframe}")
         
         # Convert to DataFrame
-        df = pd.DataFrame(kline_data)
-        df['time'] = pd.to_datetime(df['time'], unit='s')
-        df = df.set_index('time')
-        
-        if len(df) > 0:
-            pass
-        
-        # Filter date range
-        df = df[(df.index >= start_date) & (df.index <= end_date)].copy()
-        
-        if len(df) > 0:
-            pass
-        
-        return df
+        try:
+            df = pd.DataFrame(kline_data)
+            if df.empty:
+                logger.warning(f"DataFrame is empty after conversion")
+                return pd.DataFrame()
+            
+            # Handle time column - could be seconds or milliseconds
+            if 'time' not in df.columns:
+                logger.error(f"Missing 'time' column in kline data. Columns: {df.columns.tolist()}")
+                return pd.DataFrame()
+            
+            # Try seconds first, if fails try milliseconds
+            try:
+                df['time'] = pd.to_datetime(df['time'], unit='s')
+            except (ValueError, OverflowError):
+                # If seconds fails, try milliseconds
+                try:
+                    df['time'] = pd.to_datetime(df['time'], unit='ms')
+                except (ValueError, OverflowError):
+                    # If both fail, try direct conversion
+                    df['time'] = pd.to_datetime(df['time'])
+            
+            df = df.set_index('time')
+            
+            if df.empty:
+                logger.warning(f"DataFrame is empty after setting time index")
+                return pd.DataFrame()
+            
+            # Log data range before filtering
+            data_start = df.index.min()
+            data_end = df.index.max()
+            logger.info(f"Kline data range: {data_start} to {data_end}, requested range: {start_date} to {end_date}")
+            
+            # Check if requested range is within available data
+            if data_start > start_date:
+                logger.warning(f"Requested start date {start_date} is before available data start {data_start}. "
+                             f"Using available start date instead.")
+            if data_end < end_date:
+                logger.warning(f"Requested end date {end_date} is after available data end {data_end}. "
+                             f"Using available end date instead. This may affect backtest results.")
+            
+            # Filter date range (use available data range if requested range is outside)
+            # If data ends before requested end_date, use the most recent data up to the requested limit
+            if data_end < end_date:
+                # Data ends before requested end date - use the most recent data
+                # Calculate how many candles we need based on requested time range
+                requested_seconds = (end_date - start_date).total_seconds()
+                requested_candles = math.ceil(requested_seconds / tf_seconds)
+                # Take the most recent N candles from available data
+                if len(df) > requested_candles:
+                    df_filtered = df.tail(requested_candles).copy()
+                    effective_start = df_filtered.index.min()
+                    effective_end = df_filtered.index.max()
+                else:
+                    # Use all available data
+                    df_filtered = df.copy()
+                    effective_start = data_start
+                    effective_end = data_end
+                    logger.warning(f"Available data ({len(df)} candles) is less than requested ({requested_candles} candles). "
+                                 f"Using all available data from {effective_start} to {effective_end}")
+            else:
+                # Normal case: filter by requested date range
+                effective_start = max(start_date, data_start)
+                effective_end = min(end_date, data_end)
+                df_filtered = df[(df.index >= effective_start) & (df.index <= effective_end)].copy()
+            
+            if df_filtered.empty:
+                logger.error(f"After filtering date range ({effective_start} to {effective_end}), no data remains. "
+                             f"Available data range: {data_start} to {data_end}, requested: {start_date} to {end_date}")
+                return pd.DataFrame()
+            
+            logger.info(f"After filtering: {len(df_filtered)} candles remain for backtest (effective range: {effective_start} to {effective_end})")
+            _kline_cache.put(cache_key, df_filtered, timeframe)
+            return df_filtered
+            
+        except Exception as e:
+            logger.error(f"Error processing kline data: {str(e)}")
+            logger.error(traceback.format_exc())
+            return pd.DataFrame()
     
     def _execute_indicator(self, code: str, df: pd.DataFrame, backtest_params: dict = None):
         """Execute indicator code to get signals.
@@ -1094,15 +1810,21 @@ class BacktestService:
         signals = pd.Series(0, index=df.index)
         
         try:
-            # Prepare execution environment
+            # Reset DatetimeIndex to integer so user code can use df.at[0, ...] or df.iloc[0, ...]
+            df_for_exec = df.copy()
+            if isinstance(df_for_exec.index, pd.DatetimeIndex):
+                df_for_exec = df_for_exec.reset_index(drop=False)
+                if 'time' not in df_for_exec.columns:
+                    df_for_exec.rename(columns={df_for_exec.columns[0]: 'time'}, inplace=True)
+
             local_vars = {
-                'df': df.copy(),
-                'open': df['open'],
-                'high': df['high'],
-                'low': df['low'],
-                'close': df['close'],
-                'volume': df['volume'],
-                'signals': signals,
+                'df': df_for_exec,
+                'open': df_for_exec['open'],
+                'high': df_for_exec['high'],
+                'low': df_for_exec['low'],
+                'close': df_for_exec['close'],
+                'volume': df_for_exec['volume'],
+                'signals': pd.Series(0, index=df_for_exec.index),
                 'np': np,
                 'pd': pd,
             }
@@ -1133,61 +1855,28 @@ class BacktestService:
             # Add technical indicator functions
             local_vars.update(self._get_indicator_functions())
             
-            # Add safe builtins (keep full builtins to support lambda etc.)
-            # but remove dangerous functions like eval, exec, open etc.
-            import builtins
-            
-            # Create restricted __import__ that only allows safe modules
-            def safe_import(name, *args, **kwargs):
-                """Only allow importing numpy, pandas, math, json etc."""
-                allowed_modules = ['numpy', 'pandas', 'math', 'json', 'datetime', 'time']
-                if name in allowed_modules or name.split('.')[0] in allowed_modules:
-                    return builtins.__import__(name, *args, **kwargs)
-                raise ImportError(f"Import not allowed: {name}")
-            
-            safe_builtins = {k: getattr(builtins, k) for k in dir(builtins) 
-                           if not k.startswith('_') and k not in [
-                               'eval', 'exec', 'compile', 'open', 'input',
-                               'help', 'exit', 'quit',
-                               'copyright', 'credits', 'license'
-                           ]}
-            
-            # Add restricted __import__
-            safe_builtins['__import__'] = safe_import
-            
-            # Create unified execution environment (globals and locals use same dict)
-            # This allows functions to access np, pd etc.
+            from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
             exec_env = local_vars.copy()
-            exec_env['__builtins__'] = safe_builtins
-            
-            # Pre-execute import statements to ensure np and pd are available
-            pre_import_code = """
-import numpy as np
-import pandas as pd
-"""
-            exec(pre_import_code, exec_env)
-            
-            # Security check: validate code doesn't contain dangerous operations
-            from app.utils.safe_exec import validate_code_safety
-            is_safe, error_msg = validate_code_safety(code)
-            if not is_safe:
-                logger.error(f"Backtest code security check failed: {error_msg}")
-                raise ValueError(f"Code contains unsafe operations: {error_msg}")
-            
-            # Execute user code safely (with timeout)
-            from app.utils.safe_exec import safe_exec_code
-            exec_result = safe_exec_code(
+            exec_env['__builtins__'] = build_safe_builtins()
+
+            exec_result = safe_exec_with_validation(
                 code=code,
                 exec_globals=exec_env,
                 exec_locals=exec_env,
-                timeout=60  # Backtest allows longer time (60 seconds)
+                timeout=60,
             )
             
             if not exec_result['success']:
                 raise RuntimeError(f"Code execution failed: {exec_result['error']}")
             
-            # Get the executed df
+            # Get the executed df, restore DatetimeIndex for signal alignment
             executed_df = exec_env.get('df', df)
+            if isinstance(df.index, pd.DatetimeIndex) and not isinstance(executed_df.index, pd.DatetimeIndex):
+                if 'time' in executed_df.columns:
+                    executed_df = executed_df.set_index('time')
+                elif len(executed_df) == len(df):
+                    executed_df.index = df.index
 
             # Validation: if chart signals are provided, df['buy']/df['sell'] must exist for backtest normalization.
             # This keeps indicator scripts simple and consistent (chart=buy/sell, execution=normalized in backend).
@@ -1213,9 +1902,25 @@ import pandas as pd
                 # Position sizing, TP/SL, trailing, etc must be handled by strategy_config / strategy logic.
             elif all(col in executed_df.columns for col in ['buy', 'sell']):
                 # Simple buy/sell signals (recommended for indicator authors)
+                buy_series = executed_df['buy'].fillna(False).astype(bool)
+                sell_series = executed_df['sell'].fillna(False).astype(bool)
+                
+                # Ensure signals have the same index as df
+                if not buy_series.index.equals(df.index):
+                    logger.warning(f"Buy signal index mismatch in _execute_indicator! Reindexing...")
+                    buy_series = buy_series.reindex(df.index, fill_value=False)
+                if not sell_series.index.equals(df.index):
+                    logger.warning(f"Sell signal index mismatch in _execute_indicator! Reindexing...")
+                    sell_series = sell_series.reindex(df.index, fill_value=False)
+                
+                # Debug: log signal statistics
+                buy_count = buy_series.sum()
+                sell_count = sell_series.sum()
+                logger.info(f"Indicator execution: buy signals={buy_count}, sell signals={sell_count}, total_candles={len(df)}")
+                
                 signals = {
-                    'buy': executed_df['buy'].fillna(False).astype(bool),
-                    'sell': executed_df['sell'].fillna(False).astype(bool)
+                    'buy': buy_series,
+                    'sell': sell_series
                 }
             
             else:
@@ -1230,6 +1935,253 @@ import pandas as pd
             logger.error(traceback.format_exc())
         
         return signals
+
+    def _execute_script_strategy(self, code: str, df: pd.DataFrame, runtime: Optional[Dict[str, Any]] = None) -> Dict[str, pd.Series]:
+        runtime = runtime or {}
+        if not code or not str(code).strip():
+            raise ValueError("Strategy script is empty")
+
+        df_exec = df.copy().reset_index(drop=False)
+        if 'time' not in df_exec.columns:
+            df_exec.rename(columns={df_exec.columns[0]: 'time'}, inplace=True)
+
+        open_long = pd.Series(False, index=df.index)
+        close_long = pd.Series(False, index=df.index)
+        open_short = pd.Series(False, index=df.index)
+        close_short = pd.Series(False, index=df.index)
+        add_long = pd.Series(False, index=df.index)
+        add_short = pd.Series(False, index=df.index)
+
+        class ScriptBar(dict):
+            def __getattr__(self, name: str) -> Any:
+                try:
+                    return self[name]
+                except KeyError as exc:
+                    raise AttributeError(name) from exc
+
+        class ScriptPosition(dict):
+            def __init__(self):
+                super().__init__()
+                self.clear_position()
+
+            def __getattr__(self, name: str) -> Any:
+                try:
+                    return self[name]
+                except KeyError as exc:
+                    raise AttributeError(name) from exc
+
+            def __bool__(self) -> bool:
+                return bool(self.get('side')) and float(self.get('size') or 0) > 0
+
+            def __int__(self) -> int:
+                return int(self.get('direction') or 0)
+
+            def __float__(self) -> float:
+                return float(self.get('direction') or 0)
+
+            def __eq__(self, other: Any) -> bool:
+                try:
+                    return int(self) == int(other)
+                except Exception:
+                    return dict.__eq__(self, other)
+
+            def __lt__(self, other: Any) -> bool:
+                return int(self) < int(other)
+
+            def __le__(self, other: Any) -> bool:
+                return int(self) <= int(other)
+
+            def __gt__(self, other: Any) -> bool:
+                return int(self) > int(other)
+
+            def __ge__(self, other: Any) -> bool:
+                return int(self) >= int(other)
+
+            def clear_position(self) -> None:
+                self.clear()
+                self.update({
+                    'side': '',
+                    'size': 0.0,
+                    'entry_price': 0.0,
+                    'direction': 0,
+                    'amount': 0.0,
+                })
+
+            def open_position(self, side: str, entry_price: float, amount: float) -> None:
+                direction = 1 if side == 'long' else (-1 if side == 'short' else 0)
+                size = float(amount or 0.0)
+                price = float(entry_price or 0.0)
+                self.clear()
+                self.update({
+                    'side': side,
+                    'size': size,
+                    'entry_price': price,
+                    'direction': direction,
+                    'amount': size,
+                })
+
+            def add_position(self, entry_price: float, amount: float) -> None:
+                extra = float(amount or 0.0)
+                if extra <= 0:
+                    return
+                current_size = float(self.get('size') or 0.0)
+                current_price = float(self.get('entry_price') or 0.0)
+                next_size = current_size + extra
+                next_price = float(entry_price or current_price or 0.0)
+                if current_size > 0 and current_price > 0 and next_size > 0:
+                    next_price = ((current_price * current_size) + (float(entry_price or current_price) * extra)) / next_size
+                self['size'] = next_size
+                self['amount'] = next_size
+                self['entry_price'] = next_price
+
+            def reduce_position(self, amount: float) -> None:
+                """Reduce position size by *amount*. Clears to flat when size reaches zero."""
+                reduce = float(amount or 0.0)
+                if reduce <= 0:
+                    return
+                current_size = float(self.get('size') or 0.0)
+                remaining = current_size - reduce
+                if remaining <= 1e-12:
+                    self.clear_position()
+                else:
+                    self['size'] = remaining
+                    self['amount'] = remaining
+
+        class ScriptBacktestContext:
+            def __init__(self, bars_df: pd.DataFrame, initial_balance: float):
+                self._bars_df = bars_df
+                self._params: Dict[str, Any] = {}
+                self._orders: List[Dict[str, Any]] = []
+                self._logs: List[str] = []
+                self.current_index = -1
+                self.position = ScriptPosition()
+                self.balance = float(initial_balance)
+                self.equity = float(initial_balance)
+
+            def param(self, name: str, default: Any = None) -> Any:
+                if name not in self._params:
+                    self._params[name] = default
+                return self._params[name]
+
+            def bars(self, n: int = 1):
+                start = max(0, self.current_index - int(n) + 1)
+                out = []
+                for _, row in self._bars_df.iloc[start:self.current_index + 1].iterrows():
+                    out.append(ScriptBar(
+                        open=float(row.get('open') or 0),
+                        high=float(row.get('high') or 0),
+                        low=float(row.get('low') or 0),
+                        close=float(row.get('close') or 0),
+                        volume=float(row.get('volume') or 0),
+                        timestamp=row.get('time')
+                    ))
+                return out
+
+            def log(self, message: Any):
+                self._logs.append(str(message))
+
+            def buy(self, price: Any = None, amount: Any = None):
+                self._orders.append({'action': 'buy', 'price': price, 'amount': amount})
+
+            def sell(self, price: Any = None, amount: Any = None):
+                self._orders.append({'action': 'sell', 'price': price, 'amount': amount})
+
+            def close_position(self):
+                self._orders.append({'action': 'close'})
+
+        try:
+            from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
+            ctx = ScriptBacktestContext(df_exec, float(runtime.get('initial_capital') or 10000))
+            exec_env = {
+                '__builtins__': build_safe_builtins(),
+                'np': np,
+                'pd': pd,
+            }
+
+            exec_result = safe_exec_with_validation(
+                code=code,
+                exec_globals=exec_env,
+                exec_locals=exec_env,
+                timeout=60,
+            )
+            if not exec_result['success']:
+                raise RuntimeError(f"Code execution failed: {exec_result['error']}")
+
+            on_init = exec_env.get('on_init')
+            on_bar = exec_env.get('on_bar')
+            if not callable(on_bar):
+                raise ValueError("Strategy script must define on_bar(ctx, bar)")
+            if callable(on_init):
+                on_init(ctx)
+
+            trade_direction = str(runtime.get('trade_direction') or 'both').lower()
+            if trade_direction not in ('long', 'short', 'both'):
+                trade_direction = 'both'
+
+            for i, row in df_exec.iterrows():
+                ctx.current_index = int(i)
+                ctx._orders = []
+                bar = ScriptBar(
+                    open=float(row.get('open') or 0),
+                    high=float(row.get('high') or 0),
+                    low=float(row.get('low') or 0),
+                    close=float(row.get('close') or 0),
+                    volume=float(row.get('volume') or 0),
+                    timestamp=row.get('time')
+                )
+                on_bar(ctx, bar)
+
+                for order in ctx._orders:
+                    action = str(order.get('action') or '').lower()
+                    order_price = float(order.get('price') or bar['close'] or 0)
+                    order_amount = float(order.get('amount') or 0)
+                    if action == 'close':
+                        if ctx.position > 0:
+                            close_long.iloc[i] = True
+                            ctx.position.clear_position()
+                        elif ctx.position < 0:
+                            close_short.iloc[i] = True
+                            ctx.position.clear_position()
+                        continue
+
+                    if action == 'buy':
+                        if ctx.position < 0:
+                            close_short.iloc[i] = True
+                            ctx.position.clear_position()
+                        if trade_direction in ('long', 'both'):
+                            if ctx.position == 0:
+                                open_long.iloc[i] = True
+                                ctx.position.open_position('long', order_price, order_amount)
+                            else:
+                                add_long.iloc[i] = True
+                                ctx.position.add_position(order_price, order_amount)
+                        continue
+
+                    if action == 'sell':
+                        if ctx.position > 0:
+                            close_long.iloc[i] = True
+                            ctx.position.clear_position()
+                        if trade_direction in ('short', 'both'):
+                            if ctx.position == 0:
+                                open_short.iloc[i] = True
+                                ctx.position.open_position('short', order_price, order_amount)
+                            else:
+                                add_short.iloc[i] = True
+                                ctx.position.add_position(order_price, order_amount)
+
+            return {
+                'open_long': open_long,
+                'close_long': close_long,
+                'open_short': open_short,
+                'close_short': close_short,
+                'add_long': add_long,
+                'add_short': add_short,
+            }
+        except Exception as e:
+            logger.error(f"Strategy script execution error: {e}")
+            logger.error(traceback.format_exc())
+            raise
     
     def _get_indicator_functions(self) -> Dict:
         """Get technical indicator functions"""
@@ -1541,13 +2493,14 @@ import pandas as pd
             # If no position and balance low, stop trading
             if position == 0 and capital < min_capital_to_trade:
                 is_liquidated = True
+                liquidation_loss = self._liquidation_loss(capital)
                 capital = 0
                 trades.append({
                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                     'type': 'liquidation',
                     'price': round(float(row.get('close', 0) or 0), 4),
                     'amount': 0,
-                    'profit': round(-initial_capital, 2),
+                    'profit': liquidation_loss,
                     'balance': 0
                 })
                 equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': 0})
@@ -1666,6 +2619,7 @@ import pandas as pd
                         profit = (entry_price - exec_price_close) * shares - commission_fee_close
 
                         if capital + profit <= 0:
+                            liquidation_loss = self._liquidation_loss(capital)
                             capital = 0
                             is_liquidated = True
                             trades.append({
@@ -1673,7 +2627,7 @@ import pandas as pd
                                 'type': 'liquidation',
                                 'price': round(exec_price_close, 4),
                                 'amount': round(shares, 4),
-                                'profit': round(-initial_capital, 2),
+                                'profit': liquidation_loss,
                                 'balance': 0
                             })
                             position = 0
@@ -1744,13 +2698,14 @@ import pandas as pd
                 # Stop if balance too low after exit
                 if capital < min_capital_to_trade:
                     is_liquidated = True
+                    liquidation_loss = self._liquidation_loss(capital)
                     capital = 0
                     trades.append({
                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                         'type': 'liquidation',
                         'price': round(exec_price, 4),
                         'amount': 0,
-                        'profit': round(-initial_capital, 2),
+                        'profit': liquidation_loss,
                         'balance': 0
                     })
             
@@ -1767,6 +2722,7 @@ import pandas as pd
                 
                 if capital + profit <= 0:
                     logger.warning(f"Insufficient funds when closing short - liquidation")
+                    liquidation_loss = self._liquidation_loss(capital)
                     capital = 0
                     is_liquidated = True
                     trades.append({
@@ -1774,7 +2730,7 @@ import pandas as pd
                         'type': 'liquidation',
                         'price': round(exec_price, 4),
                         'amount': round(shares, 4),
-                        'profit': round(-capital, 2),
+                        'profit': liquidation_loss,
                         'balance': 0
                     })
                     position = 0
@@ -1807,13 +2763,14 @@ import pandas as pd
 
                 if capital < min_capital_to_trade:
                     is_liquidated = True
+                    liquidation_loss = self._liquidation_loss(capital)
                     capital = 0
                     trades.append({
                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                         'type': 'liquidation',
                         'price': round(exec_price, 4),
                         'amount': 0,
-                        'profit': round(-initial_capital, 2),
+                        'profit': liquidation_loss,
                         'balance': 0
                     })
             
@@ -2264,13 +3221,14 @@ import pandas as pd
                             if hit_liq and (not hit_sl or (sl_price is not None and sl_price <= liquidation_price)):
                                 # Liquidation happens before stop-loss (or stop-loss not configured).
                                 is_liquidated = True
+                                liquidation_loss = self._liquidation_loss(capital)
                                 capital = 0
                                 trades.append({
                                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                                     'type': 'liquidation',
                                     'price': round(liquidation_price, 4),
                                     'amount': round(position, 4),
-                                    'profit': round(-initial_capital, 2),
+                                    'profit': liquidation_loss,
                                     'balance': 0
                                 })
                             else:
@@ -2386,13 +3344,14 @@ import pandas as pd
                             if hit_liq and (not hit_sl or (sl_price is not None and sl_price >= liquidation_price)):
                                 # Liquidation happens before stop-loss (or stop-loss not configured).
                                 is_liquidated = True
+                                liquidation_loss = self._liquidation_loss(capital)
                                 capital = 0
                                 trades.append({
                                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                                     'type': 'liquidation',
                                     'price': round(liquidation_price, 4),
                                     'amount': round(abs(position), 4),
-                                    'profit': round(-initial_capital, 2),
+                                    'profit': liquidation_loss,
                                     'balance': 0
                                 })
                             else:
@@ -2454,13 +3413,14 @@ import pandas as pd
                         logger.warning(f"Long liquidation! entry={entry_price:.2f}, low={low:.2f}, "
                                      f"爆仓线={liquidation_price:.2f}, 止损价={stop_loss_price:.2f}")
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(liquidation_price, 4),
                             'amount': round(abs(position), 4),
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                     
@@ -2500,13 +3460,14 @@ import pandas as pd
                         logger.warning(f"Short liquidation! entry={entry_price:.2f}, high={high:.2f}, "
                                      f"爆仓线={liquidation_price:.2f}, 止损价={stop_loss_price:.2f}")
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(liquidation_price, 4),
                             'amount': round(abs(position), 4),
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                     
@@ -2562,6 +3523,7 @@ import pandas as pd
                 
                 if capital + profit <= 0:
                     logger.warning(f"Liquidation at backtest end!")
+                    liquidation_loss = self._liquidation_loss(capital)
                     capital = 0
                     is_liquidated = True
                     trades.append({
@@ -2569,7 +3531,7 @@ import pandas as pd
                         'type': 'liquidation',
                         'price': round(exec_price, 4),
                         'amount': round(shares, 4),
-                        'profit': round(-capital, 2),
+                        'profit': liquidation_loss,
                         'balance': 0
                     })
                 else:
@@ -2706,13 +3668,14 @@ import pandas as pd
             # If no position and balance low, stop trading
             if position == 0 and capital < min_capital_to_trade:
                 is_liquidated = True
+                liquidation_loss = self._liquidation_loss(capital)
                 capital = 0
                 trades.append({
                     'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                     'type': 'liquidation',
                     'price': round(float(row.get('close', 0) or 0), 4),
                     'amount': 0,
-                    'profit': round(-initial_capital, 2),
+                    'profit': liquidation_loss,
                     'balance': 0
                 })
                 equity_curve.append({'time': timestamp.strftime('%Y-%m-%d %H:%M'), 'value': 0})
@@ -2804,6 +3767,7 @@ import pandas as pd
                         # Entry commission deducted, only deduct exit commission
                         profit = (entry_price - exec_price) * shares - commission_fee
                         if capital + profit <= 0:
+                            liquidation_loss = self._liquidation_loss(capital)
                             capital = 0
                             is_liquidated = True
                             trades.append({
@@ -2811,7 +3775,7 @@ import pandas as pd
                                 'type': 'liquidation',
                                 'price': round(exec_price, 4),
                                 'amount': round(shares, 4),
-                                'profit': round(-initial_capital, 2),
+                                'profit': liquidation_loss,
                                 'balance': 0
                             })
                             position = 0
@@ -3196,13 +4160,14 @@ import pandas as pd
                     trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
                     if capital < min_capital_to_trade:
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(exec_price, 4),
                             'amount': 0,
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
             
@@ -3259,6 +4224,7 @@ import pandas as pd
                     # Check for liquidation
                     if capital + profit <= 0:
                         logger.warning(f"Insufficient funds when closing short - liquidation: capital={capital:.2f}, loss={-profit:.2f}")
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         is_liquidated = True
                         trades.append({
@@ -3266,7 +4232,7 @@ import pandas as pd
                             'type': 'liquidation',
                             'price': round(exec_price, 4),
                             'amount': round(shares, 4),
-                            'profit': round(-capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                     else:
@@ -3289,13 +4255,14 @@ import pandas as pd
                     trend_add_times = dca_add_times = trend_reduce_times = adverse_reduce_times = 0
                     if capital < min_capital_to_trade and not is_liquidated:
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(exec_price, 4),
                             'amount': 0,
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
             
@@ -3401,13 +4368,14 @@ import pandas as pd
                     # Stop if balance too low after exit
                     if capital < min_capital_to_trade or is_liquidated:
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(exec_price, 4),
                             'amount': 0,
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                         continue
@@ -3454,6 +4422,7 @@ import pandas as pd
                     # Check for liquidation
                     if capital + profit <= 0:
                         logger.warning(f"Insufficient funds when closing short - liquidation: capital={capital:.2f}, loss={-profit:.2f}")
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         is_liquidated = True
                         trades.append({
@@ -3461,7 +4430,7 @@ import pandas as pd
                             'type': 'liquidation',
                             'price': round(exec_price, 4),
                             'amount': round(shares, 4),
-                            'profit': round(-capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                         position = 0
@@ -3482,13 +4451,14 @@ import pandas as pd
                     
                     if capital < min_capital_to_trade or is_liquidated:
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(exec_price, 4),
                             'amount': 0,
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                         continue
@@ -3531,13 +4501,14 @@ import pandas as pd
                     if price <= liquidation_price:
                         logger.warning(f"Long liquidation! entry={entry_price:.2f}, current={price:.2f}, liq_price={liquidation_price:.2f}")
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(liquidation_price, 4),
                             'amount': round(abs(position), 4),
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                         position = 0
@@ -3552,13 +4523,14 @@ import pandas as pd
                     if price >= liquidation_price:
                         logger.warning(f"Short liquidation! entry={entry_price:.2f}, current={price:.2f}, liq_price={liquidation_price:.2f}")
                         is_liquidated = True
+                        liquidation_loss = self._liquidation_loss(capital)
                         capital = 0
                         trades.append({
                             'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                             'type': 'liquidation',
                             'price': round(liquidation_price, 4),
                             'amount': round(abs(position), 4),
-                            'profit': round(-initial_capital, 2),
+                            'profit': liquidation_loss,
                             'balance': 0
                         })
                         position = 0
@@ -3624,12 +4596,13 @@ import pandas as pd
                 if capital + profit <= 0:
                     logger.warning(f"Liquidation at backtest end! Close short loss too large: capital={capital:.2f}, loss={-profit:.2f}")
                     is_liquidated = True
+                    liquidation_loss = self._liquidation_loss(capital)
                     trades.append({
                         'time': timestamp.strftime('%Y-%m-%d %H:%M'),
                         'type': 'liquidation',
                         'price': round(exec_price, 4),
                         'amount': round(shares, 4),
-                        'profit': round(-capital, 2),
+                        'profit': liquidation_loss,
                         'balance': 0
                     })
                     capital = 0
@@ -3672,7 +4645,20 @@ import pandas as pd
         
         # Calculate annualized return: simple, not compound
         # For high-return strategies, compound annualization produces unrealistic numbers
-        actual_days = (end_date - start_date).total_seconds() / 86400
+        # Use actual data time range from equity_curve instead of requested start_date/end_date
+        # This fixes the issue where data may only be available until a certain date (e.g., TSLA only to January)
+        try:
+            # Parse actual start and end times from equity_curve
+            actual_start_str = equity_curve[0]['time']
+            actual_end_str = equity_curve[-1]['time']
+            actual_start = datetime.strptime(actual_start_str, '%Y-%m-%d %H:%M')
+            actual_end = datetime.strptime(actual_end_str, '%Y-%m-%d %H:%M')
+            actual_days = (actual_end - actual_start).total_seconds() / 86400
+        except (KeyError, ValueError, IndexError) as e:
+            # Fallback to requested date range if parsing fails
+            logger.warning(f"Failed to parse actual time range from equity_curve: {e}, using requested range")
+            actual_days = (end_date - start_date).total_seconds() / 86400
+        
         years = actual_days / 365.0
         
         # Simple annualization: annualized return = total return / years
@@ -3787,6 +4773,46 @@ import pandas as pd
             logger.warning(f"Sharpe ratio calculation failed: {e}")
             return 0
     
+    def _execution_assumptions(
+        self,
+        strategy_config: Optional[Dict[str, Any]],
+        *,
+        simulation_mode: str,
+        signal_timeframe: Optional[str] = None,
+        execution_timeframe: Optional[str] = None,
+        mtf_requested: bool = False,
+        mtf_active: bool = False,
+        mtf_fallback_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Human-facing metadata so the UI can explain how trades were timed vs chart markers.
+        Keys use camelCase for JSON consumers (frontend).
+        """
+        cfg = strategy_config or {}
+        raw = str((cfg.get('execution') or {}).get('signalTiming') or 'next_bar_open').strip().lower()
+        is_next_open = raw in ('next_bar_open', 'next_open', 'nextopen', 'next')
+        if raw in ('bar_close', 'close', 'same_bar_close', 'current_bar_close'):
+            timing_key = 'same_bar_close'
+        elif is_next_open:
+            timing_key = 'next_bar_open'
+        else:
+            timing_key = raw
+        default_fill = 'open' if is_next_open else 'close'
+        payload: Dict[str, Any] = {
+            'signalTiming': timing_key,
+            'signalTimingRaw': raw,
+            'defaultFillPrice': default_fill,
+            'simulationMode': simulation_mode,
+            'strategyTimeframe': signal_timeframe,
+            'executionTimeframe': execution_timeframe,
+            'engineVersion': self.ENGINE_VERSION,
+            'mtfRequested': bool(mtf_requested),
+            'mtfActive': bool(mtf_active),
+        }
+        if mtf_fallback_reason:
+            payload['mtfFallbackReason'] = mtf_fallback_reason
+        return payload
+
     def _format_result(
         self,
         metrics: Dict,

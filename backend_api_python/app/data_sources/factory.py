@@ -21,7 +21,7 @@ class DataSourceFactory:
         获取指定市场的数据源
         
         Args:
-            market: 市场类型 (Crypto, USStock, AShare, HShare)
+            market: 市场类型 (Crypto, USStock, Forex, Futures)
             
         Returns:
             数据源实例
@@ -52,15 +52,15 @@ class DataSourceFactory:
         if market == 'Crypto':
             from app.data_sources.crypto import CryptoDataSource
             return CryptoDataSource()
+        elif market == 'CNStock':
+            from app.data_sources.cn_stock import CNStockDataSource
+            return CNStockDataSource()
+        elif market == 'HKStock':
+            from app.data_sources.hk_stock import HKStockDataSource
+            return HKStockDataSource()
         elif market == 'USStock':
             from app.data_sources.us_stock import USStockDataSource
             return USStockDataSource()
-        elif market == 'AShare':
-            from app.data_sources.cn_stock import AShareDataSource
-            return AShareDataSource()
-        elif market == 'HShare':
-            from app.data_sources.cn_stock import HShareDataSource
-            return HShareDataSource()
         elif market == 'Forex':
             from app.data_sources.forex import ForexDataSource
             return ForexDataSource()

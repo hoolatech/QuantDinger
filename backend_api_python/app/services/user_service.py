@@ -4,6 +4,7 @@ User Service - Multi-user management
 Handles user CRUD operations, password hashing, and role management.
 """
 import hashlib
+import re
 import time
 import os
 from typing import Optional, Dict, Any, List
@@ -12,6 +13,9 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# IANA timezone id subset check (e.g. Asia/Shanghai, America/New_York)
+_TIMEZONE_ID_RE = re.compile(r'^[A-Za-z0-9_/+\-.]+$')
+
 # Try to import bcrypt for secure password hashing
 try:
     import bcrypt
@@ -19,6 +23,34 @@ try:
 except ImportError:
     HAS_BCRYPT = False
     logger.warning("bcrypt not installed. Using SHA256 for password hashing (less secure).")
+
+
+_DEFAULT_WATCHLIST = [
+    ("Crypto", "BTC/USDT", "Bitcoin"),
+    ("Crypto", "ETH/USDT", "Ethereum"),
+    ("Crypto", "SOL/USDT", "Solana"),
+    ("USStock", "AAPL", "Apple"),
+    ("USStock", "NVDA", "NVIDIA"),
+    ("USStock", "TSLA", "Tesla"),
+    ("USStock", "MSFT", "Microsoft"),
+]
+
+
+def _seed_default_watchlist(db, user_id: int):
+    """Insert a starter watchlist for brand-new users (FTUE)."""
+    cur = db.cursor()
+    for market, symbol, name in _DEFAULT_WATCHLIST:
+        cur.execute(
+            """
+            INSERT INTO qd_watchlist (user_id, market, symbol, name, created_at, updated_at)
+            VALUES (?, ?, ?, ?, NOW(), NOW())
+            ON CONFLICT (user_id, market, symbol) DO NOTHING
+            """,
+            (user_id, market, symbol, name),
+        )
+    db.commit()
+    cur.close()
+    logger.info(f"Seeded {len(_DEFAULT_WATCHLIST)} default watchlist items for user {user_id}")
 
 
 class UserService:
@@ -74,8 +106,38 @@ class UserService:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    SELECT id, username, email, nickname, avatar, status, role, 
-                           credits, vip_expires_at, last_login_at, created_at, updated_at
+                    SELECT id, username, email, nickname, avatar, status, role,
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
                     FROM qd_users WHERE id = ?
                     """,
                     (user_id,)
@@ -94,8 +156,8 @@ class UserService:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    SELECT id, username, password_hash, email, nickname, avatar, 
-                           status, role, last_login_at, created_at, updated_at
+                    SELECT id, username, password_hash, email, nickname, avatar,
+                           status, role, timezone, last_login_at, created_at, updated_at
                     FROM qd_users WHERE username = ?
                     """,
                     (username,)
@@ -116,8 +178,8 @@ class UserService:
                 cur = db.cursor()
                 cur.execute(
                     """
-                    SELECT id, username, password_hash, email, nickname, avatar, 
-                           status, role, last_login_at, created_at, updated_at
+                    SELECT id, username, password_hash, email, nickname, avatar,
+                           status, role, timezone, last_login_at, created_at, updated_at
                     FROM qd_users WHERE LOWER(email) = LOWER(?)
                     """,
                     (email,)
@@ -327,6 +389,20 @@ class UserService:
                     cur.close()
                 
                 logger.info(f"Created user: {username} (id={user_id}, referred_by={referred_by})")
+
+                # Seed default watchlist + builtin indicator samples for new users (FTUE)
+                if user_id:
+                    try:
+                        _seed_default_watchlist(db, user_id)
+                    except Exception as seed_err:
+                        logger.warning(f"Default watchlist seed failed for user {user_id}: {seed_err}")
+                    try:
+                        from app.services.builtin_indicators import seed_builtin_indicators_for_new_user
+
+                        seed_builtin_indicators_for_new_user(db, user_id)
+                    except Exception as ind_err:
+                        logger.warning(f"Builtin indicators seed failed for user {user_id}: {ind_err}")
+
                 return user_id
         except Exception as e:
             logger.error(f"create_user failed: {e}")
@@ -340,7 +416,7 @@ class UserService:
             user_id: User ID
             data: Fields to update (email, nickname, avatar, role, status)
         """
-        allowed_fields = ['email', 'nickname', 'avatar', 'role', 'status']
+        allowed_fields = ['email', 'nickname', 'avatar', 'role', 'status', 'timezone']
         updates = []
         values = []
         
@@ -348,6 +424,13 @@ class UserService:
             if field in data:
                 value = data[field]
                 if field == 'role' and value not in self.ROLES:
+                    continue
+                if field == 'timezone':
+                    s = '' if value is None else str(value).strip()
+                    if s and (len(s) > 64 or not _TIMEZONE_ID_RE.match(s)):
+                        continue
+                    updates.append('timezone = ?')
+                    values.append(s)
                     continue
                 updates.append(f"{field} = ?")
                 values.append(value)
@@ -461,7 +544,37 @@ class UserService:
                 # Get users
                 query_sql = f"""
                     SELECT id, username, email, nickname, avatar, status, role,
-                           credits, vip_expires_at, last_login_at, created_at, updated_at
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
                     FROM qd_users
                     {where_clause}
                     ORDER BY id DESC
@@ -481,6 +594,64 @@ class UserService:
         except Exception as e:
             logger.error(f"list_users failed: {e}")
             return {'items': [], 'total': 0, 'page': 1, 'page_size': page_size, 'total_pages': 0}
+
+    def list_all_users_for_export(self, search: str = None) -> List[Dict[str, Any]]:
+        """List all users for export with the same fields as the admin user table."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+
+                where_clause = ""
+                params = []
+                if search and search.strip():
+                    search_term = f"%{search.strip()}%"
+                    where_clause = "WHERE username LIKE ? OR email LIKE ? OR nickname LIKE ?"
+                    params = [search_term, search_term, search_term]
+
+                query_sql = f"""
+                    SELECT id, username, email, nickname, avatar, status, role,
+                           credits, vip_expires_at, timezone,
+                           COALESCE(
+                               qd_users.last_login_at,
+                               (
+                                   SELECT MAX(sl.created_at)
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('login_success', 'login_via_code', 'oauth_login')
+                               )
+                           ) AS last_login_at,
+                           COALESCE(
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('register', 'register_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               ),
+                               (
+                                   SELECT sl.ip_address
+                                   FROM qd_security_logs sl
+                                   WHERE sl.user_id = qd_users.id
+                                     AND sl.action IN ('oauth_login', 'login_success', 'login_via_code')
+                                     AND COALESCE(sl.ip_address, '') <> ''
+                                   ORDER BY sl.created_at ASC
+                                   LIMIT 1
+                               )
+                           ) AS register_ip,
+                           created_at, updated_at
+                    FROM qd_users
+                    {where_clause}
+                    ORDER BY id DESC
+                """
+                cur.execute(query_sql, tuple(params))
+                users = cur.fetchall() or []
+                cur.close()
+                return users
+        except Exception as e:
+            logger.error(f"list_all_users_for_export failed: {e}")
+            return []
     
     def get_user_permissions(self, role: str) -> List[str]:
         """Get permissions for a role"""

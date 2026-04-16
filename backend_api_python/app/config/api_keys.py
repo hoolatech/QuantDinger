@@ -12,12 +12,33 @@ class MetaAPIKeys(type):
         from app.utils.config_loader import load_addon_config
         val = load_addon_config().get('finnhub', {}).get('api_key')
         return val if val else os.getenv('FINNHUB_API_KEY', '')
+
+    @property
+    def COINGLASS_API_KEY(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('coinglass', {}).get('api_key')
+        return val if val else os.getenv('COINGLASS_API_KEY', '')
+
+    @property
+    def CRYPTOQUANT_API_KEY(cls):
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('cryptoquant', {}).get('api_key')
+        return val if val else os.getenv('CRYPTOQUANT_API_KEY', '')
     
     @property
     def TIINGO_API_KEY(cls):
         from app.utils.config_loader import load_addon_config
         val = load_addon_config().get('tiingo', {}).get('api_key')
         return val if val else os.getenv('TIINGO_API_KEY', '')
+
+    @property
+    def TWELVE_DATA_API_KEY(cls):
+        env_val = os.getenv('TWELVE_DATA_API_KEY', '').strip()
+        if env_val:
+            return env_val
+        from app.utils.config_loader import load_addon_config
+        val = load_addon_config().get('twelve_data', {}).get('api_key')
+        return val if val else ''
     
     @property
     def OPENROUTER_API_KEY(cls):
@@ -77,18 +98,6 @@ class MetaAPIKeys(type):
             return [k.strip() for k in env_val.split(',') if k.strip()]
         from app.utils.config_loader import load_addon_config
         val = load_addon_config().get('tavily', {}).get('api_keys', '')
-        if val:
-            return [k.strip() for k in val.split(',') if k.strip()]
-        return []
-    
-    @property
-    def BOCHA_API_KEYS(cls):
-        """Bocha Search API keys (comma-separated for rotation)"""
-        env_val = os.getenv('BOCHA_API_KEYS', '').strip()
-        if env_val:
-            return [k.strip() for k in env_val.split(',') if k.strip()]
-        from app.utils.config_loader import load_addon_config
-        val = load_addon_config().get('bocha', {}).get('api_keys', '')
         if val:
             return [k.strip() for k in val.split(',') if k.strip()]
         return []

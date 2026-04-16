@@ -1,7 +1,8 @@
 """
 PostgreSQL Database Connection Utility
 
-Supports multi-user mode with connection pooling and SQLite compatibility layer.
+Supports multi-user mode with connection pooling.
+Provides placeholder conversion for backward compatibility with legacy code.
 """
 import os
 import threading
@@ -116,7 +117,7 @@ def _get_connection_pool():
 
 
 class PostgresCursor:
-    """PostgreSQL cursor wrapper with SQLite placeholder compatibility"""
+    """PostgreSQL cursor wrapper with placeholder conversion for backward compatibility"""
     
     def __init__(self, cursor):
         self._cursor = cursor
@@ -124,13 +125,13 @@ class PostgresCursor:
     
     def _convert_placeholders(self, query: str) -> str:
         """
-        Convert SQLite-style ? placeholders to PostgreSQL %s
-        Also handle some SQL syntax differences
+        Convert ? placeholders to PostgreSQL %s for backward compatibility.
+        Also handle some SQL syntax differences.
         """
         # Replace ? -> %s
         query = query.replace('?', '%s')
         
-        # SQLite: INSERT OR IGNORE -> PostgreSQL: INSERT ... ON CONFLICT DO NOTHING
+        # INSERT OR IGNORE -> PostgreSQL: INSERT ... ON CONFLICT DO NOTHING
         query = query.replace('INSERT OR IGNORE', 'INSERT')
         
         return query
@@ -167,12 +168,16 @@ class PostgresCursor:
         row = self._cursor.fetchone()
         if row is None:
             return None
-        return dict(row) if row else None
+        # RealDictCursor already returns a dict, so return as-is
+        return row if isinstance(row, dict) else dict(row) if row else None
     
     def fetchall(self) -> List[Dict[str, Any]]:
         """Fetch all rows"""
         rows = self._cursor.fetchall()
-        return [dict(row) for row in rows] if rows else []
+        if not rows:
+            return []
+        # RealDictCursor already returns dicts, so return as-is
+        return [row if isinstance(row, dict) else dict(row) for row in rows]
     
     def close(self):
         """Close cursor"""
@@ -217,6 +222,16 @@ class PostgresConnection:
                 logger.warning(f"Failed to return connection to pool: {e}")
 
 
+def _ensure_session_utc(conn) -> None:
+    """每条连接检出后固定为 UTC，与 API 序列化约定一致。"""
+    try:
+        cur = conn.cursor()
+        cur.execute("SET TIME ZONE 'UTC'")
+        cur.close()
+    except Exception as e:
+        logger.warning(f"Could not SET TIME ZONE UTC on connection: {e}")
+
+
 @contextmanager
 def get_pg_connection():
     """
@@ -226,6 +241,7 @@ def get_pg_connection():
     conn = None
     try:
         conn = pool.getconn()
+        _ensure_session_utc(conn)
         pg_conn = PostgresConnection(conn)
         yield pg_conn
     except Exception as e:
@@ -234,7 +250,10 @@ def get_pg_connection():
                 conn.rollback()
             except Exception:
                 pass
-        logger.error(f"PostgreSQL operation error: {e}")
+        # 记录更详细的错误信息
+        error_msg = str(e) if e else repr(e)
+        error_type = type(e).__name__
+        logger.error(f"PostgreSQL operation error ({error_type}): {error_msg}", exc_info=True)
         raise
     finally:
         if conn:
@@ -250,6 +269,7 @@ def get_pg_connection_sync() -> PostgresConnection:
     """
     pool = _get_connection_pool()
     conn = pool.getconn()
+    _ensure_session_utc(conn)
     return PostgresConnection(conn)
 
 

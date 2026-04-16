@@ -3,6 +3,7 @@ Backtest API routes
 """
 from flask import Blueprint, request, jsonify, g
 from datetime import datetime
+import calendar
 import traceback
 import json
 import time
@@ -18,6 +19,27 @@ logger = get_logger(__name__)
 
 backtest_bp = Blueprint('backtest', __name__)
 backtest_service = BacktestService()
+
+
+def _add_months(dt: datetime, months: int) -> datetime:
+    """Add calendar months while keeping the day within the target month."""
+    month_index = (dt.month - 1) + int(months or 0)
+    year = dt.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(dt.day, calendar.monthrange(year, month)[1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def _backtest_range_limit(timeframe: str, start_date: datetime) -> tuple[datetime, str]:
+    """Return the max allowed end date and human-readable label for a timeframe."""
+    tf = str(timeframe or '').strip()
+    if tf == '1m':
+        return _add_months(start_date, 1), '1 month'
+    if tf == '5m':
+        return _add_months(start_date, 6), '6 months'
+    if tf in ['15m', '30m']:
+        return _add_months(start_date, 12), '1 year'
+    return _add_months(start_date, 36), '3 years'
 
 
 def _openrouter_base_and_key() -> tuple[str, str]:
@@ -38,7 +60,7 @@ def _normalize_lang(lang: str | None) -> str:
     """
     Normalize language code for AI output.
 
-    This should align with frontend i18n locales under `quantdinger_vue/src/locales/lang`.
+    This should align with frontend i18n locales in the private Vue app (`src/locales/lang`).
     Supported:
       - zh-CN, zh-TW, en-US, ko-KR, th-TH, vi-VN, ar-SA, de-DE, fr-FR, ja-JP
     Default: zh-CN
@@ -168,6 +190,10 @@ def run_backtest():
         enable_mtf = data.get('enableMtf', True)
         if isinstance(enable_mtf, str):
             enable_mtf = enable_mtf.lower() in ['true', '1', 'yes']
+        # persist toggle: skip DB write when False for faster iteration
+        persist = data.get('persist', True)
+        if isinstance(persist, str):
+            persist = persist.lower() in ['true', '1', 'yes']
         
         # (Debug) log received params if needed
         
@@ -201,22 +227,11 @@ def run_backtest():
         
         # 验证时间范围限制
         days_diff = (end_date - start_date).days
+        max_end_date, max_range_text = _backtest_range_limit(timeframe, start_date)
+        max_end_date = max_end_date.replace(hour=23, minute=59, second=59)
         
-        # 根据周期设置不同的时间限制
-        if timeframe == '1m':
-            max_days = 30  # 1分钟K线最多1个月
-            max_range_text = '1 month'
-        elif timeframe == '5m':
-            max_days = 180  # 5分钟K线最多6个月
-            max_range_text = '6 months'
-        elif timeframe in ['15m', '30m']:
-            max_days = 365  # 15分钟和30分钟K线最多1年
-            max_range_text = '1 year'
-        else:  # 1H, 4H, 1D, 1W
-            max_days = 1095  # 1小时及以上最多3年
-            max_range_text = '3 years'
-        
-        if days_diff > max_days:
+        if end_date > max_end_date:
+            max_days = (max_end_date - start_date).days
             return jsonify({
                 'code': 0,
                 'msg': f'Backtest range exceeds limit: timeframe {timeframe} supports up to {max_range_text} ({max_days} days), but you selected {days_diff} days',
@@ -265,44 +280,29 @@ def run_backtest():
                 'message': '使用标准K线回测'
             }
 
-        # Persist backtest run for AI optimization / history
         run_id = None
-        try:
-            with get_db_connection() as db:
-                cur = db.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO qd_backtest_runs
-                    (user_id, indicator_id, market, symbol, timeframe, start_date, end_date,
-                     initial_capital, commission, slippage, leverage, trade_direction,
-                     strategy_config, status, error_message, result_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                    """,
-                    (
-                        user_id,
-                        int(indicator_id) if indicator_id is not None else None,
-                        market,
-                        symbol,
-                        timeframe,
-                        start_date_str,
-                        end_date_str,
-                        initial_capital,
-                        commission,
-                        slippage,
-                        leverage,
-                        trade_direction,
-                        json.dumps(strategy_config or {}, ensure_ascii=False),
-                        'success',
-                        '',
-                        json.dumps(result or {}, ensure_ascii=False)
-                    )
-                )
-                run_id = cur.lastrowid
-                db.commit()
-                cur.close()
-        except Exception:
-            # Do not break the main backtest response if persistence fails.
-            logger.warning("Failed to persist backtest run", exc_info=True)
+        if persist:
+            run_id = backtest_service.persist_run(
+                user_id=user_id,
+                indicator_id=int(indicator_id) if indicator_id is not None else None,
+                run_type='indicator',
+                market=market,
+                symbol=symbol,
+                timeframe=timeframe,
+                start_date_str=start_date_str,
+                end_date_str=end_date_str,
+                initial_capital=initial_capital,
+                commission=commission,
+                slippage=slippage,
+                leverage=leverage,
+                trade_direction=trade_direction,
+                strategy_config=strategy_config,
+                config_snapshot={'indicatorId': int(indicator_id) if indicator_id is not None else None},
+                status='success',
+                error_message='',
+                result=result,
+                code=indicator_code,
+            )
         
         return jsonify({
             'code': 1,
@@ -323,42 +323,31 @@ def run_backtest():
     except Exception as e:
         logger.error(f"Backtest failed: {str(e)}")
         logger.error(traceback.format_exc())
-        # Best-effort persist failed run (if we have enough context)
         try:
             data = data if isinstance(data, dict) else {}
             user_id = g.user_id
             indicator_id = data.get('indicatorId')
-            with get_db_connection() as db:
-                cur = db.cursor()
-                cur.execute(
-                    """
-                    INSERT INTO qd_backtest_runs
-                    (user_id, indicator_id, market, symbol, timeframe, start_date, end_date,
-                     initial_capital, commission, slippage, leverage, trade_direction,
-                     strategy_config, status, error_message, result_json, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-                    """,
-                    (
-                        user_id,
-                        int(indicator_id) if indicator_id is not None else None,
-                        str(data.get('market', '') or ''),
-                        str(data.get('symbol', '') or ''),
-                        str(data.get('timeframe', '') or ''),
-                        str(data.get('startDate', '') or ''),
-                        str(data.get('endDate', '') or ''),
-                        float(data.get('initialCapital', 0) or 0),
-                        float(data.get('commission', 0) or 0),
-                        float(data.get('slippage', 0) or 0),
-                        int(data.get('leverage', 1) or 1),
-                        str(data.get('tradeDirection', 'long') or 'long'),
-                        json.dumps(data.get('strategyConfig') or {}, ensure_ascii=False),
-                        'failed',
-                        str(e),
-                        ''
-                    )
-                )
-                db.commit()
-                cur.close()
+            backtest_service.persist_run(
+                user_id=user_id,
+                indicator_id=int(indicator_id) if indicator_id is not None else None,
+                run_type='indicator',
+                market=str(data.get('market', '') or ''),
+                symbol=str(data.get('symbol', '') or ''),
+                timeframe=str(data.get('timeframe', '') or ''),
+                start_date_str=str(data.get('startDate', '') or ''),
+                end_date_str=str(data.get('endDate', '') or ''),
+                initial_capital=float(data.get('initialCapital', 0) or 0),
+                commission=float(data.get('commission', 0) or 0),
+                slippage=float(data.get('slippage', 0) or 0),
+                leverage=int(data.get('leverage', 1) or 1),
+                trade_direction=str(data.get('tradeDirection', 'long') or 'long'),
+                strategy_config=data.get('strategyConfig') or {},
+                config_snapshot={'indicatorId': int(indicator_id) if indicator_id is not None else None},
+                status='failed',
+                error_message=str(e),
+                result=None,
+                code=str(data.get('indicatorCode', '') or ''),
+            )
         except Exception:
             pass
         return jsonify({
@@ -391,53 +380,22 @@ def get_backtest_history():
         offset = max(0, offset)
 
         indicator_id = request.args.get('indicatorId')
+        strategy_id = request.args.get('strategyId')
+        run_type = (request.args.get('runType') or '').strip()
         symbol = (request.args.get('symbol') or '').strip()
         market = (request.args.get('market') or '').strip()
         timeframe = (request.args.get('timeframe') or '').strip()
-
-        where = ["user_id = ?"]
-        params = [user_id]
-        if indicator_id is not None and str(indicator_id).strip() != "":
-            try:
-                where.append("indicator_id = ?")
-                params.append(int(indicator_id))
-            except Exception:
-                pass
-        if symbol:
-            where.append("symbol = ?")
-            params.append(symbol)
-        if market:
-            where.append("market = ?")
-            params.append(market)
-        if timeframe:
-            where.append("timeframe = ?")
-            params.append(timeframe)
-        where_sql = " AND ".join(where)
-
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                f"""
-                SELECT id, user_id, indicator_id, market, symbol, timeframe,
-                       start_date, end_date, initial_capital, commission, slippage,
-                       leverage, trade_direction, strategy_config, status, error_message,
-                       created_at
-                FROM qd_backtest_runs
-                WHERE {where_sql}
-                ORDER BY id DESC
-                LIMIT ? OFFSET ?
-                """,
-                (*params, limit, offset)
-            )
-            rows = cur.fetchall() or []
-            cur.close()
-
-        # Parse strategy_config JSON best-effort
-        for r in rows:
-            try:
-                r['strategy_config'] = json.loads(r.get('strategy_config') or '{}')
-            except Exception:
-                pass
+        rows = backtest_service.list_runs(
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+            indicator_id=int(indicator_id) if indicator_id is not None and str(indicator_id).strip() != "" else None,
+            strategy_id=int(strategy_id) if strategy_id is not None and str(strategy_id).strip() != "" else None,
+            run_type=run_type or None,
+            symbol=symbol,
+            market=market,
+            timeframe=timeframe,
+        )
 
         return jsonify({'code': 1, 'msg': 'OK', 'data': rows})
     except Exception as e:
@@ -461,34 +419,9 @@ def get_backtest_run():
         if not run_id:
             return jsonify({'code': 0, 'msg': 'runId is required', 'data': None}), 400
 
-        with get_db_connection() as db:
-            cur = db.cursor()
-            cur.execute(
-                """
-                SELECT id, user_id, indicator_id, market, symbol, timeframe,
-                       start_date, end_date, initial_capital, commission, slippage,
-                       leverage, trade_direction, strategy_config, status, error_message,
-                       result_json, created_at
-                FROM qd_backtest_runs
-                WHERE id = ? AND user_id = ?
-                """,
-                (run_id, user_id),
-            )
-            row = cur.fetchone()
-            cur.close()
-
+        row = backtest_service.get_run(user_id=user_id, run_id=run_id)
         if not row:
             return jsonify({'code': 0, 'msg': 'run not found', 'data': None}), 404
-
-        try:
-            row['strategy_config'] = json.loads(row.get('strategy_config') or '{}')
-        except Exception:
-            pass
-        try:
-            row['result'] = json.loads(row.get('result_json') or '{}')
-        except Exception:
-            row['result'] = {}
-        row.pop('result_json', None)
 
         return jsonify({'code': 1, 'msg': 'OK', 'data': row})
     except Exception as e:
@@ -724,6 +657,7 @@ def ai_analyze_backtest_runs():
     try:
         data = request.get_json() or {}
         user_id = g.user_id
+        backtest_service.ensure_storage_schema()
         lang = _normalize_lang(data.get('lang'))
         run_ids = data.get('runIds') or []
         if not isinstance(run_ids, list) or not run_ids:
@@ -740,9 +674,9 @@ def ai_analyze_backtest_runs():
             cur = db.cursor()
             cur.execute(
                 f"""
-                SELECT id, user_id, indicator_id, market, symbol, timeframe,
+                SELECT id, user_id, indicator_id, strategy_id, strategy_name, run_type, market, symbol, timeframe,
                        start_date, end_date, initial_capital, commission, slippage,
-                       leverage, trade_direction, strategy_config, status, error_message,
+                       leverage, trade_direction, strategy_config, config_snapshot, status, error_message,
                        result_json, created_at
                 FROM qd_backtest_runs
                 WHERE user_id = ? AND id IN ({placeholders})
@@ -759,6 +693,10 @@ def ai_analyze_backtest_runs():
                 r['strategy_config'] = json.loads(r.get('strategy_config') or '{}')
             except Exception:
                 r['strategy_config'] = {}
+            try:
+                r['config_snapshot'] = json.loads(r.get('config_snapshot') or '{}')
+            except Exception:
+                r['config_snapshot'] = {}
             try:
                 r['result'] = json.loads(r.get('result_json') or '{}')
             except Exception:
@@ -806,6 +744,9 @@ def ai_analyze_backtest_runs():
             "selectedRuns": [
                 {
                     "id": r.get("id"),
+                    "strategy_id": r.get("strategy_id"),
+                    "strategy_name": r.get("strategy_name"),
+                    "run_type": r.get("run_type"),
                     "market": r.get("market"),
                     "symbol": r.get("symbol"),
                     "timeframe": r.get("timeframe"),
@@ -814,6 +755,7 @@ def ai_analyze_backtest_runs():
                     "leverage": r.get("leverage"),
                     "trade_direction": r.get("trade_direction"),
                     "strategy_config": r.get("strategy_config") or {},
+                    "config_snapshot": r.get("config_snapshot") or {},
                     "result": r.get("result") or {},
                     "status": r.get("status"),
                 }
@@ -833,7 +775,7 @@ def ai_analyze_backtest_runs():
                     {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
                 ],
             },
-            timeout=120,
+            timeout=30,
         )
         try:
             resp.raise_for_status()

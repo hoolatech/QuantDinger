@@ -3,6 +3,7 @@ Portfolio API routes (local-only).
 Manages manual positions (user's existing holdings) and AI monitoring tasks.
 """
 from flask import Blueprint, request, jsonify, g
+from datetime import date, datetime, timezone
 import json
 import traceback
 import time
@@ -37,6 +38,27 @@ _last_request_time = {}  # {market: timestamp}
 
 def _now_ts() -> int:
     return int(time.time())
+
+
+def _serialize_monitor_ts(value):
+    """
+    JSON 序列化监控时间字段。PostgreSQL TIMESTAMP 无 tz 时按 UTC 解释（与 Docker 默认一致），
+    输出带 Z 的 ISO，避免前端把无时区字符串当本地时间而偏差 8 小时。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            dt = value.replace(tzinfo=timezone.utc)
+        else:
+            dt = value.astimezone(timezone.utc)
+        s = dt.isoformat()
+        if s.endswith("+00:00"):
+            return s[:-6] + "Z"
+        return s
+    if isinstance(value, date):
+        return value.isoformat()
+    return value
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -250,20 +272,17 @@ def add_position():
         
         with get_db_connection() as db:
             cur = db.cursor()
+            # Delete any existing positions for this symbol (regardless of side),
+            # ensuring only one position per symbol per user per group.
+            cur.execute(
+                "DELETE FROM qd_manual_positions WHERE user_id = ? AND market = ? AND symbol = ? AND group_name = ?",
+                (user_id, market, symbol, group_name)
+            )
             cur.execute(
                 """
                 INSERT INTO qd_manual_positions 
                 (user_id, market, symbol, name, side, quantity, entry_price, entry_time, notes, tags, group_name, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
-                ON CONFLICT(user_id, market, symbol, side, group_name) DO UPDATE SET
-                    name = excluded.name,
-                    quantity = excluded.quantity,
-                    entry_price = excluded.entry_price,
-                    entry_time = excluded.entry_time,
-                    notes = excluded.notes,
-                    tags = excluded.tags,
-                    group_name = excluded.group_name,
-                    updated_at = NOW()
                 """,
                 (user_id, market, symbol, name, side, quantity, entry_price, entry_time, notes, tags_json, group_name)
             )
@@ -522,12 +541,12 @@ def get_monitors():
                 'config': _safe_json_loads(row.get('config'), {}),
                 'notification_config': _safe_json_loads(row.get('notification_config'), {}),
                 'is_active': bool(row.get('is_active')),
-                'last_run_at': row.get('last_run_at'),
-                'next_run_at': row.get('next_run_at'),
+                'last_run_at': _serialize_monitor_ts(row.get('last_run_at')),
+                'next_run_at': _serialize_monitor_ts(row.get('next_run_at')),
                 'last_result': _safe_json_loads(row.get('last_result'), {}),
                 'run_count': row.get('run_count') or 0,
-                'created_at': row.get('created_at'),
-                'updated_at': row.get('updated_at')
+                'created_at': _serialize_monitor_ts(row.get('created_at')),
+                'updated_at': _serialize_monitor_ts(row.get('updated_at'))
             })
 
         return jsonify({'code': 1, 'msg': 'success', 'data': monitors})
@@ -557,8 +576,8 @@ def add_monitor():
         if monitor_type not in ('ai', 'price_alert', 'pnl_alert'):
             monitor_type = 'ai'
         
-        # Calculate next_run_at based on interval
-        interval_minutes = int(config.get('interval_minutes') or 60)
+        # Calculate next_run_at based on interval (frontend sends run_interval_minutes)
+        interval_minutes = int(config.get('run_interval_minutes') or config.get('interval_minutes') or 60)
         
         position_ids_json = json.dumps(position_ids if isinstance(position_ids, list) else [], ensure_ascii=False)
         config_json = json.dumps(config if isinstance(config, dict) else {}, ensure_ascii=False)
@@ -578,6 +597,25 @@ def add_monitor():
             monitor_id = cur.lastrowid
             db.commit()
             cur.close()
+
+        # 创建后立即在后台跑一轮：立刻发通知，并以完成时刻为基准写入 next_run_at（间隔后再次执行）
+        if is_active and monitor_id:
+            try:
+                from app.services.portfolio_monitor import run_single_monitor as _run_single_monitor
+
+                def _initial_run():
+                    try:
+                        _run_single_monitor(int(monitor_id), user_id=int(user_id))
+                    except Exception as ex:
+                        logger.error(f"Initial portfolio monitor run failed #{monitor_id}: {ex}")
+
+                threading.Thread(
+                    target=_initial_run,
+                    daemon=True,
+                    name=f"monitor-init-{monitor_id}",
+                ).start()
+            except Exception as ex:
+                logger.error(f"Failed to schedule initial monitor run #{monitor_id}: {ex}")
 
         return jsonify({'code': 1, 'msg': 'success', 'data': {'id': monitor_id}})
     except Exception as e:
@@ -616,8 +654,8 @@ def update_monitor(monitor_id):
             updates.append('config = ?')
             params.append(json.dumps(config if isinstance(config, dict) else {}, ensure_ascii=False))
             
-            # Recalculate next_run_at if interval changed (handled separately for PostgreSQL)
-            next_run_interval = int(config.get('interval_minutes') or 60)
+            # Recalculate next_run_at if interval changed
+            next_run_interval = int(config.get('run_interval_minutes') or config.get('interval_minutes') or 60)
         
         if 'notification_config' in data:
             notification_config = data.get('notification_config') or {}

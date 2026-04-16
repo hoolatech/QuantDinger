@@ -10,16 +10,21 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import urlencode
 
 from app.services.live_trading.base import BaseRestClient, LiveOrderResult, LiveTradingError
+
+logger = logging.getLogger(__name__)
 from app.services.live_trading.symbols import to_okx_swap_inst_id, to_okx_spot_inst_id
 
 
 class OkxClient(BaseRestClient):
+    _DEFAULT_BROKER_CODE = "56fa80b0ce8cBCDE"
+
     def __init__(
         self,
         *,
@@ -28,11 +33,16 @@ class OkxClient(BaseRestClient):
         passphrase: str,
         base_url: str = "https://www.okx.com",
         timeout_sec: float = 15.0,
+        broker_code: Optional[str] = None,
+        simulated_trading: bool = False,
     ):
         super().__init__(base_url=base_url, timeout_sec=timeout_sec)
         self.api_key = (api_key or "").strip()
         self.secret_key = (secret_key or "").strip()
         self.passphrase = (passphrase or "").strip()
+        self.simulated_trading = bool(simulated_trading)
+        effective_broker = broker_code or self._DEFAULT_BROKER_CODE
+        self.broker_code = str(effective_broker).strip() if effective_broker else None
         if not self.api_key or not self.secret_key or not self.passphrase:
             raise LiveTradingError("Missing OKX api_key/secret_key/passphrase")
 
@@ -265,13 +275,16 @@ class OkxClient(BaseRestClient):
         return base64.b64encode(mac).decode("utf-8")
 
     def _headers(self, ts: str, sign: str) -> Dict[str, str]:
-        return {
+        h: Dict[str, str] = {
             "OK-ACCESS-KEY": self.api_key,
             "OK-ACCESS-SIGN": sign,
             "OK-ACCESS-TIMESTAMP": ts,
             "OK-ACCESS-PASSPHRASE": self.passphrase,
             "Content-Type": "application/json",
         }
+        if self.simulated_trading:
+            h["x-simulated-trading"] = "1"
+        return h
 
     def _signed_request(
         self,
@@ -294,21 +307,79 @@ class OkxClient(BaseRestClient):
         if params:
             # OKX expects the query string in the signed request path. Keep key order stable.
             # Convert all values to string to avoid "True"/"False" surprises.
-            norm = {str(k): "" if v is None else str(v) for k, v in dict(params).items()}
-            qs = urlencode(sorted(norm.items()), doseq=True)
+            # Filter out empty strings and None values (OKX doesn't like empty params)
+            norm = {str(k): str(v) for k, v in dict(params).items() if v is not None and str(v).strip() != ""}
+            if norm:
+                # Sort by key to ensure consistent ordering (OKX requirement)
+                qs = urlencode(sorted(norm.items()), doseq=True)
 
         signed_path = f"{path}?{qs}" if qs else path
         sign = self._sign(ts, method, signed_path, body_str)
+        
+        # For GET requests with query params, we need to ensure the actual request URL matches the signed path
+        # OKX requires exact match between signed path and actual request path
+        if method.upper() == "GET" and qs:
+            # Append query string directly to path to match signature exactly
+            # Don't use params parameter to avoid double encoding
+            request_path = f"{path}?{qs}"
+            request_params = None
+        else:
+            request_path = path
+            request_params = params
+        
         code, data, text = self._request(
             method,
-            path,
-            params=params,
+            request_path,
+            params=request_params,
             data=body_str if body_str else None,
             headers=self._headers(ts, sign),
         )
         if code >= 400:
-            raise LiveTradingError(f"OKX HTTP {code}: {text[:500]}")
+            # Provide more helpful error messages for common permission issues
+            error_msg = text[:500] if text else f"HTTP {code}"
+            if code == 401:
+                error_code = ""
+                if isinstance(data, dict):
+                    error_code = str(data.get("code") or "")
+                if error_code == "50120" or "permission" in error_msg.lower():
+                    raise LiveTradingError(
+                        f"OKX API permission error (HTTP {code}, code {error_code}): {error_msg}\n"
+                        f"Solution: Please enable 'Trade' permission for your API key in OKX account.\n"
+                        f"Path: OKX website -> API Management -> Edit API Key -> Enable 'Trade' permission"
+                    )
+            raise LiveTradingError(f"OKX HTTP {code}: {error_msg}")
         if isinstance(data, dict) and str(data.get("code") or "") not in ("0", ""):
+            error_code = str(data.get("code") or "")
+            error_msg = str(data.get("msg") or data)
+            
+            # Check for specific error codes in data array
+            data_array = data.get("data", [])
+            if isinstance(data_array, list) and data_array:
+                first_item = data_array[0] if isinstance(data_array[0], dict) else {}
+                s_code = str(first_item.get("sCode") or "")
+                s_msg = str(first_item.get("sMsg") or "")
+                
+                # Error code 51008: Insufficient margin
+                if s_code == "51008" or "insufficient" in s_msg.lower() or "margin" in s_msg.lower():
+                    raise LiveTradingError(
+                        f"OKX insufficient margin error (code {s_code}): {s_msg}\n"
+                        f"Solution: Please ensure you have sufficient USDT margin in your account to place this order."
+                    )
+                # Error code 50120: Permission error
+                if s_code == "50120" or error_code == "50120" or "permission" in str(error_msg).lower():
+                    raise LiveTradingError(
+                        f"OKX API permission error (code {s_code or error_code}): {s_msg or error_msg}\n"
+                        f"Solution: Please enable 'Trade' permission for your API key in OKX account.\n"
+                        f"Path: OKX website -> API Management -> Edit API Key -> Enable 'Trade' permission"
+                    )
+            
+            # Fallback for permission errors
+            if error_code == "50120" or "permission" in str(error_msg).lower():
+                raise LiveTradingError(
+                    f"OKX API permission error (code {error_code}): {error_msg}\n"
+                    f"Solution: Please enable 'Trade' permission for your API key in OKX account.\n"
+                    f"Path: OKX website -> API Management -> Edit API Key -> Enable 'Trade' permission"
+                )
             raise LiveTradingError(f"OKX error: {data}")
         return data if isinstance(data, dict) else {"raw": data}
 
@@ -316,21 +387,60 @@ class OkxClient(BaseRestClient):
         code, data, _ = self._request("GET", "/api/v5/public/time")
         return code == 200 and isinstance(data, dict)
 
+    def get_ticker(self, *, inst_id: str) -> Dict[str, Any]:
+        """
+        Get ticker price for an instrument.
+        
+        Endpoint: GET /api/v5/market/ticker?instId=...
+        """
+        if not inst_id:
+            return {}
+        raw = self._public_request("GET", "/api/v5/market/ticker", params={"instId": inst_id})
+        data = (raw.get("data") or []) if isinstance(raw, dict) else []
+        first: Dict[str, Any] = data[0] if isinstance(data, list) and data else {}
+        return first if isinstance(first, dict) else {}
+
     def get_balance(self) -> Dict[str, Any]:
         """
         Private endpoint to validate credentials (best-effort).
         """
         return self._signed_request("GET", "/api/v5/account/balance")
 
-    def get_positions(self, *, inst_id: str = "") -> Dict[str, Any]:
+    def get_fee_rate(self, symbol: str, market_type: str = "swap") -> Optional[Dict[str, float]]:
+        inst_type = "SPOT" if market_type == "spot" else "SWAP"
+        inst_id = symbol.upper()
+        try:
+            raw = self._signed_request("GET", "/api/v5/account/trade-fee", params={"instType": inst_type, "instId": inst_id})
+            data = (raw.get("data") or []) if isinstance(raw, dict) else []
+            if data and isinstance(data[0], dict):
+                rec = data[0]
+                maker = abs(float(rec.get("maker") or rec.get("makerU") or 0))
+                taker = abs(float(rec.get("taker") or rec.get("takerU") or 0))
+                if maker > 0 or taker > 0:
+                    return {"maker": maker, "taker": taker}
+        except Exception as e:
+            logger.warning(f"OKX get_fee_rate({symbol}) failed: {e}")
+        return None
+
+    def get_positions(self, *, inst_id: str = "", inst_type: str = "SWAP") -> Dict[str, Any]:
         """
-        Get swap positions (best-effort).
+        Get positions (best-effort).
+        
+        Args:
+            inst_id: Instrument ID (optional, for filtering)
+            inst_type: Instrument type - "SPOT" or "SWAP" (default: "SWAP")
 
         Endpoint: GET /api/v5/account/positions
         """
-        params: Dict[str, Any] = {"instType": "SWAP"}
-        if inst_id:
-            params["instId"] = str(inst_id)
+        # Validate inst_type
+        it = str(inst_type or "SWAP").strip().upper()
+        if it not in ("SPOT", "SWAP", "FUTURES", "OPTION"):
+            it = "SWAP"
+        
+        params: Dict[str, Any] = {"instType": it}
+        # Only add instId if it's not empty
+        if inst_id and str(inst_id).strip():
+            params["instId"] = str(inst_id).strip()
         return self._signed_request("GET", "/api/v5/account/positions", params=params)
 
     def set_leverage(self, *, inst_id: str, lever: float, mgn_mode: str = "cross", pos_side: str = "") -> bool:
@@ -487,6 +597,8 @@ class OkxClient(BaseRestClient):
                 body["reduceOnly"] = "true"
         if client_order_id:
             body["clOrdId"] = str(client_order_id)
+        if self.broker_code:
+            body["tag"] = str(self.broker_code)
 
         raw = self._signed_request("POST", "/api/v5/trade/order", json_body=body)
         data = (raw.get("data") or []) if isinstance(raw, dict) else []
@@ -562,6 +674,8 @@ class OkxClient(BaseRestClient):
 
         if client_order_id:
             body["clOrdId"] = str(client_order_id)
+        if self.broker_code:
+            body["tag"] = str(self.broker_code)
 
         raw = self._signed_request("POST", "/api/v5/trade/order", json_body=body)
         data = (raw.get("data") or []) if isinstance(raw, dict) else []

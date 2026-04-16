@@ -86,6 +86,11 @@ class KucoinSpotClient(BaseRestClient):
     def get_accounts(self) -> Any:
         return self._signed_request("GET", "/api/v1/accounts")
 
+    def get_ticker(self, *, symbol: str) -> Dict[str, Any]:
+        raw = self._public_request("GET", "/api/v1/market/orderbook/level1", params={"symbol": to_kucoin_symbol(symbol)})
+        data = raw.get("data") if isinstance(raw, dict) else None
+        return data if isinstance(data, dict) else {}
+
     def place_limit_order(self, *, symbol: str, side: str, size: float, price: float, client_order_id: Optional[str] = None) -> LiveOrderResult:
         sd = (side or "").strip().lower()
         if sd not in ("buy", "sell"):
@@ -174,6 +179,7 @@ class KucoinSpotClient(BaseRestClient):
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
+            timed_out = time.time() >= end_ts
             try:
                 resp = self.get_order(order_id=str(order_id))
                 last = resp if isinstance(resp, dict) else {"raw": resp}
@@ -202,6 +208,9 @@ class KucoinSpotClient(BaseRestClient):
                 fee = 0.0
             fee_ccy = str(od.get("feeCurrency") or "").strip()
             if filled > 0 and avg_price > 0:
+                if fee <= 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             # If order is inactive, consider it terminal
             try:
@@ -209,8 +218,11 @@ class KucoinSpotClient(BaseRestClient):
             except Exception:
                 is_active = False
             if not is_active:
+                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
-            if time.time() >= end_ts:
+            if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 
@@ -462,10 +474,11 @@ class KucoinFuturesClient(BaseRestClient):
             return self._signed_request("GET", f"/api/v1/orders/byClientOid", params={"clientOid": str(client_order_id)})
         raise LiveTradingError("KuCoinFutures get_order requires order_id or client_order_id")
 
-    def wait_for_fill(self, *, order_id: str, max_wait_sec: float = 3.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
+    def wait_for_fill(self, *, order_id: str, max_wait_sec: float = 12.0, poll_interval_sec: float = 0.5) -> Dict[str, Any]:
         end_ts = time.time() + float(max_wait_sec or 0.0)
         last: Dict[str, Any] = {}
         while True:
+            timed_out = time.time() >= end_ts
             try:
                 resp = self.get_order(order_id=str(order_id))
                 last = resp if isinstance(resp, dict) else {"raw": resp}
@@ -508,10 +521,16 @@ class KucoinFuturesClient(BaseRestClient):
             if fee > 0:
                 fee_ccy = "USDT"
             if filled > 0 and avg_price > 0:
+                if fee <= 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             if status.lower() in ("done", "canceled", "cancelled", "filled"):
+                if fee <= 0 and filled > 0 and avg_price > 0 and not timed_out:
+                    time.sleep(float(poll_interval_sec or 0.5))
+                    continue
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
-            if time.time() >= end_ts:
+            if timed_out:
                 return {"filled": filled, "avg_price": avg_price, "fee": fee, "fee_ccy": fee_ccy, "status": status, "order": last}
             time.sleep(float(poll_interval_sec or 0.5))
 

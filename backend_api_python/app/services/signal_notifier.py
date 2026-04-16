@@ -24,10 +24,11 @@ import json
 import os
 import smtplib
 import time
-import traceback
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from typing import Any, Dict, List, Optional, Tuple
+
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -77,6 +78,43 @@ def _signal_meta(signal_type: str) -> Dict[str, str]:
 
     side = "long" if "long" in st else ("short" if "short" in st else "")
     return {"action": action, "side": side, "type": st}
+
+
+def _load_user_timezone_for_strategy(strategy_id: int) -> str:
+    try:
+        sid = int(strategy_id)
+    except Exception:
+        return ""
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                SELECT COALESCE(u.timezone, '') AS tz
+                FROM qd_strategies_trading s
+                JOIN qd_users u ON u.id = s.user_id
+                WHERE s.id = ?
+                """,
+                (sid,),
+            )
+            row = cur.fetchone() or {}
+            cur.close()
+        return str(row.get("tz") or "").strip()
+    except Exception:
+        return ""
+
+
+def _utc_ts_to_user_display(now: int, user_timezone: str) -> Tuple[str, str, str]:
+    """Return (utc_iso, display_local_str, label_for_plaintext)."""
+    iso = datetime.fromtimestamp(int(now), tz=timezone.utc).isoformat()
+    utz = (user_timezone or "").strip()
+    if not utz:
+        return iso, iso, "Time (UTC)"
+    try:
+        dt = datetime.fromtimestamp(int(now), tz=timezone.utc).astimezone(ZoneInfo(utz))
+        return iso, dt.strftime("%Y-%m-%d %H:%M:%S"), f"Time ({utz})"
+    except Exception:
+        return iso, iso, "Time (UTC)"
 
 
 def _fmt_float(value: Any, *, max_decimals: int = 10) -> str:
@@ -151,6 +189,7 @@ class SignalNotifier:
         targets = _safe_json(cfg.get("targets") or {})
         extra = extra if isinstance(extra, dict) else {}
 
+        user_tz = _load_user_timezone_for_strategy(int(strategy_id))
         payload = self._build_payload(
             strategy_id=strategy_id,
             strategy_name=strategy_name,
@@ -160,6 +199,7 @@ class SignalNotifier:
             stake_amount=stake_amount,
             direction=direction,
             extra=extra,
+            user_timezone=user_tz,
         )
         rendered = self._render_messages(payload)
         title = rendered.get("title") or ""
@@ -253,9 +293,10 @@ class SignalNotifier:
         stake_amount: float,
         direction: str,
         extra: Dict[str, Any],
+        user_timezone: str = "",
     ) -> Dict[str, Any]:
         now = int(time.time())
-        iso = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+        iso, disp, tlab = _utc_ts_to_user_display(now, user_timezone)
         meta = _signal_meta(signal_type)
 
         pending_id = None
@@ -269,6 +310,8 @@ class SignalNotifier:
             "version": 1,
             "timestamp": now,
             "timestamp_iso": iso,
+            "timestamp_display": disp,
+            "time_label": tlab,
             "strategy": {
                 "id": int(strategy_id),
                 "name": str(strategy_name or ""),
@@ -311,6 +354,8 @@ class SignalNotifier:
         pending_id = int(trace.get("pending_order_id") or 0) if trace.get("pending_order_id") else 0
         mode = str(trace.get("mode") or "")
         ts_iso = str(payload.get("timestamp_iso") or "")
+        ts_disp = str(payload.get("timestamp_display") or "") or ts_iso
+        ts_lbl = str(payload.get("time_label") or "Time")
 
         plain_lines = [
             "QuantDinger Signal",
@@ -324,8 +369,8 @@ class SignalNotifier:
             plain_lines.append(f"PendingOrder: {pending_id}")
         if mode:
             plain_lines.append(f"Mode: {mode}")
-        if ts_iso:
-            plain_lines.append(f"Time(UTC): {ts_iso}")
+        if ts_disp:
+            plain_lines.append(f"{ts_lbl}: {ts_disp}")
 
         # Telegram (HTML) message. Escape all dynamic values.
         t_strategy = f"{strategy.get('name') or ''} (#{int(strategy.get('id') or 0)})"
@@ -342,8 +387,8 @@ class SignalNotifier:
             telegram_lines.append(f"<b>PendingOrder</b>: <code>{pending_id}</code>")
         if mode:
             telegram_lines.append(f"<b>Mode</b>: <code>{html.escape(mode)}</code>")
-        if ts_iso:
-            telegram_lines.append(f"<b>Time (UTC)</b>: <code>{html.escape(ts_iso)}</code>")
+        if ts_disp:
+            telegram_lines.append(f"<b>{html.escape(ts_lbl)}</b>: <code>{html.escape(ts_disp)}</code>")
         telegram_html = "\n".join([x for x in telegram_lines if x is not None])
 
         # Email (HTML) message. Keep inline CSS for maximum compatibility.
@@ -356,7 +401,8 @@ class SignalNotifier:
             stake_text=stake_s,
             pending_id=pending_id or None,
             mode_text=mode or "",
-            timestamp_iso=ts_iso or "",
+            timestamp_display=ts_disp or "",
+            time_row_label=ts_lbl or "Time",
         )
 
         return {
@@ -377,7 +423,8 @@ class SignalNotifier:
         stake_text: str,
         pending_id: Optional[int],
         mode_text: str,
-        timestamp_iso: str,
+        timestamp_display: str,
+        time_row_label: str,
     ) -> str:
         def esc(s: Any) -> str:
             return html.escape(str(s or ""))
@@ -393,8 +440,8 @@ class SignalNotifier:
             rows.append(("PendingOrder", str(int(pending_id))))
         if mode_text:
             rows.append(("Mode", mode_text))
-        if timestamp_iso:
-            rows.append(("Time (UTC)", timestamp_iso))
+        if timestamp_display:
+            rows.append((time_row_label or "Time", timestamp_display))
 
         tr_html = "\n".join(
             [
@@ -419,7 +466,7 @@ class SignalNotifier:
     <div style="max-width:640px;margin:0 auto;padding:24px;">
       <div style="background:#111827;color:#ffffff;padding:16px 18px;border-radius:12px 12px 0 0;">
         <div style="font-size:16px;letter-spacing:0.2px;font-weight:600;">{esc(title_text)}</div>
-        <div style="margin-top:6px;font-size:12px;color:#d1d5db;">{esc(timestamp_iso) if timestamp_iso else ""}</div>
+        <div style="margin-top:6px;font-size:12px;color:#d1d5db;">{esc(timestamp_display) if timestamp_display else ""}</div>
       </div>
       <div style="background:#ffffff;border:1px solid #eaecef;border-top:0;border-radius:0 0 12px 12px;overflow:hidden;">
         <table cellpadding="0" cellspacing="0" style="width:100%;border-collapse:collapse;">
@@ -437,7 +484,7 @@ class SignalNotifier:
     def _notify_browser(
         self,
         *,
-        strategy_id: int,
+        strategy_id: Optional[int] = None,
         symbol: str,
         signal_type: str,
         channels: List[str],
@@ -450,15 +497,19 @@ class SignalNotifier:
             now = int(time.time())
             # Get user_id from strategy if not provided
             if user_id is None:
-                try:
-                    with get_db_connection() as db:
-                        cur = db.cursor()
-                        cur.execute("SELECT user_id FROM qd_strategies_trading WHERE id = ?", (strategy_id,))
-                        row = cur.fetchone()
-                        cur.close()
-                    user_id = int((row or {}).get('user_id') or 1)
-                except Exception:
+                if strategy_id is not None:
+                    try:
+                        with get_db_connection() as db:
+                            cur = db.cursor()
+                            cur.execute("SELECT user_id FROM qd_strategies_trading WHERE id = ?", (int(strategy_id),))
+                            row = cur.fetchone()
+                            cur.close()
+                        user_id = int((row or {}).get('user_id') or 1)
+                    except Exception:
+                        user_id = 1
+                else:
                     user_id = 1
+            sid = None if strategy_id is None else int(strategy_id)
             with get_db_connection() as db:
                 cur = db.cursor()
                 cur.execute(
@@ -469,7 +520,7 @@ class SignalNotifier:
                     """,
                     (
                         int(user_id),
-                        int(strategy_id),
+                        sid,
                         str(symbol or ""),
                         str(signal_type or ""),
                         ",".join([str(c) for c in (channels or [])]),
@@ -483,7 +534,7 @@ class SignalNotifier:
             return True, ""
         except Exception as e:
             logger.warning(f"browser notify persist failed: {e}")
-            logger.error('browser.error', traceback=traceback.format_exc())
+            logger.exception("browser.error")
             return False, str(e)
 
     def _notify_webhook(
@@ -573,7 +624,7 @@ class SignalNotifier:
                 return False, f"http_{resp2.status_code}:{(resp2.text or '')[:300]}"
             return False, f"http_{resp.status_code}:{(resp.text or '')[:300]}"
         except Exception as e:
-            logger.error('webhook.error', traceback=traceback.format_exc())
+            logger.exception("webhook.error")
             return False, str(e)
 
     def _notify_discord(self, *, url: str, payload: Dict[str, Any], fallback_text: str) -> Tuple[bool, str]:
@@ -649,7 +700,7 @@ class SignalNotifier:
                 pass
             return False, f"http_{resp.status_code}:{(resp.text or '')[:300]}"
         except Exception as e:
-            logger.error('discord.error', traceback=traceback.format_exc())
+            logger.exception("discord.error")
             return False, str(e)
 
     def _notify_telegram(
@@ -684,15 +735,21 @@ class SignalNotifier:
                 return True, ""
             return False, f"http_{resp.status_code}:{(resp.text or '')[:300]}"
         except Exception as e:
-            logger.error('telegram.error', traceback=traceback.format_exc())
+            logger.exception("telegram.error")
             return False, str(e)
 
     def _notify_email(self, *, to_email: str, subject: str, body_text: str, body_html: str = "") -> Tuple[bool, str]:
         if not to_email:
+            logger.warning("email.skip: missing recipient (to_email empty)")
             return False, "missing_email_target"
         if not self.smtp_host:
+            logger.warning(
+                "email.skip: SMTP_HOST not configured (set in system env / admin Email settings); "
+                "test notification and all outbound mail require it"
+            )
             return False, "missing_SMTP_HOST"
         if not self.smtp_from:
+            logger.warning("email.skip: SMTP_FROM not configured (usually same as SMTP_USER or a verified sender)")
             return False, "missing_SMTP_FROM"
 
         msg = EmailMessage()
@@ -706,14 +763,15 @@ class SignalNotifier:
         try:
             # Heuristic: if port is 465 and SMTP_USE_SSL is not explicitly set, assume SSL.
             use_ssl = bool(self.smtp_use_ssl) or int(self.smtp_port or 0) == 465
+            smtp_timeout = max(self.timeout_sec, 20)
             if use_ssl:
-                with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=self.timeout_sec) as server:
+                with smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=smtp_timeout) as server:
                     server.ehlo()
                     if self.smtp_user and self.smtp_password:
                         server.login(self.smtp_user, self.smtp_password)
                     server.send_message(msg)
             else:
-                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=self.timeout_sec) as server:
+                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=smtp_timeout) as server:
                     server.ehlo()
                     if self.smtp_use_tls:
                         server.starttls()
@@ -723,7 +781,7 @@ class SignalNotifier:
                     server.send_message(msg)
             return True, ""
         except Exception as e:
-            logger.error('email.error', traceback=traceback.format_exc())
+            logger.exception("email.error")
             return False, str(e)
 
     def _notify_phone(self, *, to_phone: str, body: str) -> Tuple[bool, str]:
@@ -740,7 +798,114 @@ class SignalNotifier:
                 return True, ""
             return False, f"http_{resp.status_code}:{(resp.text or '')[:300]}"
         except Exception as e:
-            logger.error('phone.error', traceback=traceback.format_exc())
+            logger.exception("phone.error")
             return False, str(e)
+
+    def send_profile_test_notifications(
+        self,
+        *,
+        user_id: int,
+        channels: List[str],
+        targets: Dict[str, Any],
+        language: str = "en-US",
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Send a short test message to each selected channel (profile / notification settings).
+        Used by POST /api/users/notification-settings/test.
+        """
+        lang = (language or "en-US").strip().lower()
+        zh = lang.startswith("zh")
+        title = "QuantDinger 通知测试" if zh else "QuantDinger notification test"
+        plain = (
+            "这是一条来自 QuantDinger 个人中心「通知设置」的测试消息。若您收到本条消息，说明该渠道配置正确。"
+            if zh
+            else "This is a test message from QuantDinger profile notification settings. "
+            "If you received this, the channel is configured correctly."
+        )
+        html_body = f"<p>{html.escape(plain)}</p>"
+        telegram_html = f"<b>{html.escape(title)}</b>\n\n{html.escape(plain)}"
+
+        now = int(time.time())
+        iso = datetime.now(timezone.utc).isoformat()
+        test_payload: Dict[str, Any] = {
+            "event": "qd.profile_test",
+            "version": 1,
+            "timestamp": now,
+            "timestamp_iso": iso,
+            "strategy": {"id": 0, "name": "Profile Test"},
+            "instrument": {"symbol": "TEST"},
+            "signal": {"type": "profile_test", "action": "test", "side": ""},
+            "order": {"ref_price": 0.0, "stake_amount": 0.0},
+            "trace": {},
+            "extra": {"kind": "profile_test"},
+        }
+
+        results: Dict[str, Dict[str, Any]] = {}
+        ch_list = _as_list(channels)
+        if not ch_list:
+            ch_list = ["browser"]
+
+        for ch in ch_list:
+            c = (ch or "").strip().lower()
+            if not c:
+                continue
+            ok, err = False, ""
+            try:
+                if c == "browser":
+                    ok, err = self._notify_browser(
+                        strategy_id=None,
+                        symbol="TEST",
+                        signal_type="profile_test",
+                        channels=ch_list,
+                        title=title,
+                        message=html_body,
+                        payload=test_payload,
+                        user_id=int(user_id),
+                    )
+                elif c == "telegram":
+                    chat_id = str((targets or {}).get("telegram") or "").strip()
+                    token_override = str(
+                        (targets or {}).get("telegram_bot_token")
+                        or (targets or {}).get("telegram_token")
+                        or ""
+                    ).strip()
+                    ok, err = self._notify_telegram(
+                        chat_id=chat_id,
+                        text=telegram_html,
+                        token_override=token_override,
+                        parse_mode="HTML",
+                    )
+                elif c == "email":
+                    to_email = str((targets or {}).get("email") or "").strip()
+                    ok, err = self._notify_email(
+                        to_email=to_email,
+                        subject=title,
+                        body_text=plain,
+                        body_html=html_body,
+                    )
+                elif c == "phone":
+                    to_phone = str((targets or {}).get("phone") or "").strip()
+                    ok, err = self._notify_phone(to_phone=to_phone, body=f"{title}\n\n{plain}")
+                elif c == "discord":
+                    url = str((targets or {}).get("discord") or "").strip()
+                    ok, err = self._notify_discord(url=url, payload=test_payload, fallback_text=f"{title}\n\n{plain}")
+                elif c == "webhook":
+                    url = str((targets or {}).get("webhook") or "").strip()
+                    tok = str((targets or {}).get("webhook_token") or "").strip()
+                    wh_payload = {
+                        "event": "qd.profile_test",
+                        "title": title,
+                        "message": plain,
+                        "timestamp": now,
+                        "timestamp_iso": iso,
+                    }
+                    ok, err = self._notify_webhook(url=url, payload=wh_payload, token_override=tok or None)
+                else:
+                    ok, err = False, f"unsupported_channel:{c}"
+            except Exception as e:
+                ok, err = False, str(e)
+            results[c] = {"ok": bool(ok), "error": (err or "")}
+
+        return results
 
 

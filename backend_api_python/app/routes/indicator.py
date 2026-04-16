@@ -16,7 +16,6 @@ import re
 import time
 import traceback
 from typing import Any, Dict, List
-
 from flask import Blueprint, Response, jsonify, request, g
 import pandas as pd
 import numpy as np
@@ -24,7 +23,7 @@ import numpy as np
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 from app.utils.auth import login_required
-from app.services.indicator_params import IndicatorCaller
+from app.services.indicator_params import IndicatorCaller, IndicatorParamsParser
 import requests
 
 logger = get_logger(__name__)
@@ -57,7 +56,7 @@ def _extract_indicator_meta_from_code(code: str) -> Dict[str, str]:
 
 def _row_to_indicator(row: Dict[str, Any], user_id: int) -> Dict[str, Any]:
     """
-    Map SQLite row -> frontend expected indicator shape.
+    Map database row -> frontend expected indicator shape.
 
     Frontend uses:
     - id, name, description, code
@@ -76,6 +75,8 @@ def _row_to_indicator(row: Dict[str, Any], user_id: int) -> Dict[str, Any]:
         "publish_to_community": row.get("publish_to_community") if row.get("publish_to_community") is not None else 0,
         "pricing_type": row.get("pricing_type") or "free",
         "price": row.get("price") if row.get("price") is not None else 0,
+        # VIP-free indicator flag (community publishing)
+        "vip_free": 1 if (row.get("vip_free") or 0) else 0,
         # Local mode: encryption is not supported; keep field for frontend compatibility (always 0).
         "is_encrypted": 0,
         "preview_image": row.get("preview_image") or "",
@@ -117,6 +118,296 @@ def _generate_mock_df(length=200):
     return df
 
 
+def _merge_indicator_params(code: str, user_params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    declared_params = IndicatorParamsParser.parse_params(code or "")
+    return IndicatorParamsParser.merge_params(declared_params, user_params or {})
+
+
+def _validate_indicator_code_internal(code: str, user_params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    """
+    Shared validation for indicator code generation and verifyCode.
+
+    Returns:
+      {
+        "success": bool,
+        "msg": str,
+        "error_type": str | None,
+        "details": str | None,
+        "plots_count": int,
+        "signals_count": int,
+        "hints": [...]
+      }
+    """
+    from app.services.indicator_code_quality import analyze_indicator_code_quality
+    from app.utils.safe_exec import build_safe_builtins, safe_exec_with_validation
+
+    raw = (code or "").strip()
+    if not raw:
+        return {
+            "success": False,
+            "msg": "Code is empty",
+            "error_type": "EmptyCode",
+            "details": None,
+            "plots_count": 0,
+            "signals_count": 0,
+            "hints": [{"severity": "error", "code": "EMPTY_CODE", "params": {}}],
+        }
+
+    hints = analyze_indicator_code_quality(raw)
+    df = _generate_mock_df()
+    merged_params = _merge_indicator_params(raw, user_params)
+
+    exec_env = {
+        'df': df.copy(),
+        'pd': pd,
+        'np': np,
+        'params': merged_params,
+        'output': None,
+    }
+    exec_env['__builtins__'] = build_safe_builtins()
+
+    exec_result = safe_exec_with_validation(
+        code=raw,
+        exec_globals=exec_env,
+        exec_locals=exec_env,
+        timeout=20,
+    )
+    if not exec_result.get('success'):
+        error_detail = exec_result.get('error') or 'Unknown error'
+        is_security = error_detail.startswith('Unsafe code rejected')
+        return {
+            "success": False,
+            "msg": f"{'Security' if is_security else 'Runtime'} Error: {error_detail}",
+            "error_type": "SecurityError" if is_security else "RuntimeError",
+            "details": error_detail,
+            "plots_count": 0,
+            "signals_count": 0,
+            "hints": hints,
+        }
+
+    output = exec_env.get('output')
+    if output is None:
+        return {
+            "success": False,
+            "msg": "Missing 'output' variable. Your code must define an 'output' dictionary.",
+            "error_type": "MissingOutput",
+            "details": None,
+            "plots_count": 0,
+            "signals_count": 0,
+            "hints": hints,
+        }
+
+    if not isinstance(output, dict):
+        return {
+            "success": False,
+            "msg": f"'output' must be a dictionary, got {type(output).__name__}",
+            "error_type": "InvalidOutputType",
+            "details": None,
+            "plots_count": 0,
+            "signals_count": 0,
+            "hints": hints,
+        }
+
+    if 'plots' not in output and 'signals' not in output:
+        return {
+            "success": False,
+            "msg": "'output' dict should contain 'plots' or 'signals' list.",
+            "error_type": "InvalidOutputStructure",
+            "details": None,
+            "plots_count": 0,
+            "signals_count": 0,
+            "hints": hints,
+        }
+
+    plots = output.get('plots', [])
+    signals = output.get('signals', [])
+
+    for p in plots:
+        if 'data' not in p:
+            return {
+                "success": False,
+                "msg": f"Plot '{p.get('name')}' missing 'data' field.",
+                "error_type": "InvalidPlot",
+                "details": None,
+                "plots_count": len(plots),
+                "signals_count": len(signals),
+                "hints": hints,
+            }
+        if len(p['data']) != len(df):
+            return {
+                "success": False,
+                "msg": f"Plot '{p.get('name')}' data length ({len(p['data'])}) does not match DataFrame length ({len(df)}).",
+                "error_type": "LengthMismatch",
+                "details": None,
+                "plots_count": len(plots),
+                "signals_count": len(signals),
+                "hints": hints,
+            }
+
+    for s in signals:
+        if 'data' not in s:
+            return {
+                "success": False,
+                "msg": f"Signal '{s.get('type')}' missing 'data' field.",
+                "error_type": "InvalidSignal",
+                "details": None,
+                "plots_count": len(plots),
+                "signals_count": len(signals),
+                "hints": hints,
+            }
+        if len(s['data']) != len(df):
+            return {
+                "success": False,
+                "msg": f"Signal '{s.get('type')}' data length ({len(s['data'])}) does not match DataFrame length ({len(df)}).",
+                "error_type": "LengthMismatch",
+                "details": None,
+                "plots_count": len(plots),
+                "signals_count": len(signals),
+                "hints": hints,
+            }
+
+    return {
+        "success": True,
+        "msg": "Verification passed! Code executed successfully.",
+        "error_type": None,
+        "details": None,
+        "plots_count": len(plots),
+        "signals_count": len(signals),
+        "hints": hints,
+    }
+
+
+def _indicator_debug_summary(validation: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    validation = validation or {}
+    hints = validation.get("hints") or []
+    return {
+        "success": bool(validation.get("success")),
+        "message": validation.get("msg"),
+        "error_type": validation.get("error_type"),
+        "hint_codes": [h.get("code") for h in hints if h.get("code")],
+        "hint_count": len(hints),
+        "plots_count": validation.get("plots_count", 0),
+        "signals_count": validation.get("signals_count", 0),
+    }
+
+
+def _request_lang(default: str = "zh-CN") -> str:
+    raw = (
+        request.headers.get("X-App-Lang")
+        or request.headers.get("Accept-Language")
+        or default
+    )
+    lang = str(raw or default).split(",", 1)[0].strip()
+    return lang or default
+
+
+def _is_zh_lang(lang: str | None) -> bool:
+    return str(lang or "zh-CN").strip().lower().startswith("zh")
+
+
+def _indicator_ai_text(key: str, lang: str = "zh-CN") -> str:
+    is_zh = _is_zh_lang(lang)
+    texts = {
+        "prompt_required": "提示词不能为空" if is_zh else "Prompt cannot be empty",
+        "insufficient_credits": "积分不足，请充值后重试" if is_zh else "Insufficient credits. Please top up and try again.",
+    }
+    return texts.get(key, key)
+
+
+def _indicator_hint_to_text(hint_code: str, params: Dict[str, Any] | None = None, lang: str = "zh-CN") -> str:
+    params = params or {}
+    is_zh = _is_zh_lang(lang)
+    if hint_code == "DECLARED_PARAMS_NOT_READ_VIA_PARAMS_GET":
+        names = params.get("names") or []
+        joined = "、".join(names) if (names and is_zh) else ", ".join(names)
+        if not joined:
+            joined = "参数" if is_zh else "parameters"
+        return (
+            f"已检测到声明的参数未通过 params.get(...) 读取：{joined}。"
+            if is_zh else
+            f"Declared parameters are not being read via params.get(...): {joined}."
+        )
+    if hint_code == "SIGNAL_MARKERS_USE_WHERE_NONE":
+        return (
+            "已检测到信号标记使用 where(..., None).tolist()，建议改为显式 None 列表以避免 NaN 渲染问题。"
+            if is_zh else
+            "Signal markers use where(..., None).tolist(); prefer an explicit None list to avoid NaN rendering issues."
+        )
+    if hint_code == "MISSING_OUTPUT":
+        return "缺少 output 字典。" if is_zh else "Missing output dictionary."
+    if hint_code == "MISSING_BUY_SELL_COLUMNS":
+        return "缺少 df['buy'] 或 df['sell'] 信号列。" if is_zh else "Missing df['buy'] or df['sell'] signal columns."
+    if hint_code == "MISSING_DF_COPY":
+        return "缺少 df = df.copy()。" if is_zh else "Missing df = df.copy()."
+    if hint_code == "MISSING_INDICATOR_NAME":
+        return "缺少 my_indicator_name。" if is_zh else "Missing my_indicator_name."
+    if hint_code == "MISSING_INDICATOR_DESCRIPTION":
+        return "缺少 my_indicator_description。" if is_zh else "Missing my_indicator_description."
+    if hint_code == "UNKNOWN_STRATEGY_KEY":
+        key = params.get('key') or 'unknown'
+        return (
+            f"存在未知的 @strategy 键：{key}。"
+            if is_zh else
+            f"Unknown @strategy key detected: {key}."
+        )
+    if hint_code == "NO_STRATEGY_ANNOTATIONS":
+        return "没有声明任何 @strategy 默认配置。" if is_zh else "No @strategy default configuration was declared."
+    if hint_code == "NO_STOP_AND_TAKE_PROFIT":
+        return "未声明止损和止盈默认配置。" if is_zh else "Stop-loss and take-profit defaults are not declared."
+    if hint_code == "NO_STOP_LOSS":
+        return "未声明止损默认配置。" if is_zh else "Stop-loss default is not declared."
+    if hint_code == "NO_TAKE_PROFIT":
+        return "未声明止盈默认配置。" if is_zh else "Take-profit default is not declared."
+    return f"检测到代码提示：{hint_code}" if is_zh else f"Code hint detected: {hint_code}"
+
+
+def _indicator_human_summary(
+    initial_validation: Dict[str, Any],
+    final_validation: Dict[str, Any],
+    auto_fix_applied: bool,
+    auto_fix_succeeded: bool,
+    returned_candidate: str,
+    lang: str = "zh-CN",
+) -> Dict[str, Any]:
+    is_zh = _is_zh_lang(lang)
+    initial_hints = initial_validation.get("hints") or []
+    final_hints = final_validation.get("hints") or []
+    initial_codes = {h.get("code") for h in initial_hints if h.get("code")}
+    final_codes = {h.get("code") for h in final_hints if h.get("code")}
+    fixed_codes = sorted(initial_codes - final_codes)
+    remaining_codes = sorted(final_codes)
+
+    fixed_messages = [
+        _indicator_hint_to_text(h.get("code"), h.get("params"), lang=lang)
+        for h in initial_hints
+        if h.get("code") in fixed_codes
+    ]
+    remaining_messages = [
+        _indicator_hint_to_text(h.get("code"), h.get("params"), lang=lang)
+        for h in final_hints
+        if h.get("code") in remaining_codes
+    ]
+
+    if auto_fix_applied and auto_fix_succeeded:
+        title = "AI 已自动修复并返回更稳定的指标代码" if is_zh else "AI auto-fixed the indicator code and returned a more stable version"
+    elif auto_fix_applied:
+        title = "AI 尝试自动修复，但仍保留部分问题" if is_zh else "AI attempted to auto-fix the code, but some issues still remain"
+    else:
+        title = "AI 已生成指标代码，并通过当前质检流程" if is_zh else "AI generated indicator code and it passed the current QA flow"
+
+    if returned_candidate == "repaired":
+        returned_text = "当前返回的是自动修复后的代码。" if is_zh else "The returned code is the auto-fixed version."
+    else:
+        returned_text = "当前返回的是首次生成的代码。" if is_zh else "The returned code is the initially generated version."
+
+    return {
+        "title": title,
+        "returned_text": returned_text,
+        "fixed_messages": fixed_messages,
+        "remaining_messages": remaining_messages,
+    }
+
+
 @indicator_bp.route("/getIndicators", methods=["GET"])
 @login_required
 def get_indicators():
@@ -131,12 +422,17 @@ def get_indicators():
 
         with get_db_connection() as db:
             cur = db.cursor()
+            # Best-effort schema upgrade for VIP-free indicators
+            try:
+                cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS vip_free BOOLEAN DEFAULT FALSE")
+            except Exception:
+                pass
             # Get user's own indicators (both purchased and custom).
             cur.execute(
                 """
                 SELECT
                   id, user_id, is_buy, end_time, name, code, description,
-                  publish_to_community, pricing_type, price, is_encrypted, preview_image,
+                  publish_to_community, pricing_type, price, is_encrypted, preview_image, vip_free,
                   createtime, updatetime, created_at, updated_at
                 FROM qd_indicator_codes
                 WHERE user_id = ?
@@ -178,6 +474,7 @@ def save_indicator():
         description = (data.get("description") or "").strip()
         publish_to_community = 1 if data.get("publishToCommunity") or data.get("publish_to_community") else 0
         pricing_type = (data.get("pricingType") or data.get("pricing_type") or "free").strip() or "free"
+        vip_free = bool(data.get("vipFree") or data.get("vip_free"))
         try:
             price = float(data.get("price") or 0)
         except Exception:
@@ -206,6 +503,27 @@ def save_indicator():
         
         with get_db_connection() as db:
             cur = db.cursor()
+            # Best-effort schema upgrade for VIP-free indicators
+            try:
+                cur.execute("ALTER TABLE qd_indicator_codes ADD COLUMN IF NOT EXISTS vip_free BOOLEAN DEFAULT FALSE")
+            except Exception:
+                pass
+            # 市场购买的副本不可改库中源码：应「另存为」新建 is_buy=0 的指标再编辑
+            if indicator_id and indicator_id > 0:
+                cur.execute(
+                    "SELECT is_buy FROM qd_indicator_codes WHERE id = ? AND user_id = ?",
+                    (indicator_id, user_id),
+                )
+                _existing_buy = cur.fetchone()
+                if _existing_buy and int(_existing_buy.get("is_buy") or 0) == 1:
+                    cur.close()
+                    return jsonify(
+                        {
+                            "code": 0,
+                            "msg": "indicator_purchased_readonly",
+                            "data": None,
+                        }
+                    ), 403
             if indicator_id and indicator_id > 0:
                 # 检查是否从未发布改为发布，需要设置审核状态
                 if publish_to_community:
@@ -224,11 +542,12 @@ def save_indicator():
                             UPDATE qd_indicator_codes
                             SET name = ?, code = ?, description = ?,
                                 publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
+                                vip_free = ?,
                                 review_status = ?, review_note = '', reviewed_at = NOW(), reviewed_by = ?,
                                 updatetime = ?, updated_at = NOW()
                             WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
                             """,
-                            (name, code, description, publish_to_community, pricing_type, price, preview_image, 
+                            (name, code, description, publish_to_community, pricing_type, price, preview_image, vip_free,
                              new_review_status, user_id if is_admin else None, now, indicator_id, user_id),
                         )
                     else:
@@ -238,10 +557,11 @@ def save_indicator():
                             UPDATE qd_indicator_codes
                             SET name = ?, code = ?, description = ?,
                                 publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
+                                vip_free = ?,
                                 updatetime = ?, updated_at = NOW()
                             WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
                             """,
-                            (name, code, description, publish_to_community, pricing_type, price, preview_image, now, indicator_id, user_id),
+                            (name, code, description, publish_to_community, pricing_type, price, preview_image, vip_free, now, indicator_id, user_id),
                         )
                 else:
                     # 取消发布，清除审核状态
@@ -250,6 +570,7 @@ def save_indicator():
                         UPDATE qd_indicator_codes
                         SET name = ?, code = ?, description = ?,
                             publish_to_community = ?, pricing_type = ?, price = ?, preview_image = ?,
+                            vip_free = FALSE,
                             review_status = NULL, review_note = '', reviewed_at = NULL, reviewed_by = NULL,
                             updatetime = ?, updated_at = NOW()
                         WHERE id = ? AND user_id = ? AND (is_buy IS NULL OR is_buy = 0)
@@ -265,11 +586,11 @@ def save_indicator():
                     """
                     INSERT INTO qd_indicator_codes
                       (user_id, is_buy, end_time, name, code, description,
-                       publish_to_community, pricing_type, price, preview_image, review_status,
+                       publish_to_community, pricing_type, price, preview_image, vip_free, review_status,
                        createtime, updatetime, created_at, updated_at)
-                    VALUES (?, 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
+                    VALUES (?, 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), NOW())
                     """,
-                    (user_id, name, code, description, publish_to_community, pricing_type, price, preview_image, review_status, now, now),
+                    (user_id, name, code, description, publish_to_community, pricing_type, price, preview_image, vip_free, review_status, now, now),
                 )
                 indicator_id = int(cur.lastrowid or 0)
             db.commit()
@@ -366,93 +687,25 @@ def verify_code():
         if not code or not str(code).strip():
             return jsonify({"code": 0, "msg": "Code is empty", "data": None}), 400
 
-        # 1. Generate mock data
-        df = _generate_mock_df()
-        
-        # 2. Prepare execution environment
-        exec_env = {
-            'df': df.copy(),
-            'pd': pd,
-            'np': np,
-            'output': None
-        }
-        
-        # 3. Execute code
-        try:
-            exec(code, exec_env)
-        except SyntaxError as e:
+        validation = _validate_indicator_code_internal(code, data.get("params") or {})
+        if not validation["success"]:
             return jsonify({
-                "code": 0, 
-                "msg": f"Syntax Error at line {e.lineno}: {e.msg}", 
-                "data": {"type": "SyntaxError", "line": e.lineno, "details": str(e)}
+                "code": 0,
+                "msg": validation["msg"],
+                "data": {
+                    "type": validation["error_type"],
+                    "details": validation["details"],
+                    "hints": validation.get("hints", []),
+                }
             })
-        except Exception as e:
-            # Capture traceback for better debugging
-            tb = traceback.format_exc()
-            # Extract the line number from the exec() call in the traceback if possible
-            # This is tricky because the traceback includes the backend frames. 
-            # We'll just return the exception message.
-            return jsonify({
-                "code": 0, 
-                "msg": f"Runtime Error: {str(e)}", 
-                "data": {"type": type(e).__name__, "details": tb}
-            })
-            
-        # 4. Check output
-        output = exec_env.get('output')
-        
-        if output is None:
-            return jsonify({
-                "code": 0, 
-                "msg": "Missing 'output' variable. Your code must define an 'output' dictionary.", 
-                "data": {"type": "MissingOutput"}
-            })
-            
-        if not isinstance(output, dict):
-            return jsonify({
-                "code": 0, 
-                "msg": f"'output' must be a dictionary, got {type(output).__name__}", 
-                "data": {"type": "InvalidOutputType"}
-            })
-            
-        # Check required fields
-        if 'plots' not in output and 'signals' not in output:
-             return jsonify({
-                "code": 0, 
-                "msg": "'output' dict should contain 'plots' or 'signals' list.", 
-                "data": {"type": "InvalidOutputStructure"}
-            })
-            
-        # Basic check for lengths
-        plots = output.get('plots', [])
-        signals = output.get('signals', [])
-        
-        for p in plots:
-            if 'data' not in p:
-                return jsonify({"code": 0, "msg": f"Plot '{p.get('name')}' missing 'data' field.", "data": {"type": "InvalidPlot"}})
-            if len(p['data']) != len(df):
-                return jsonify({
-                    "code": 0, 
-                    "msg": f"Plot '{p.get('name')}' data length ({len(p['data'])}) does not match DataFrame length ({len(df)}).", 
-                    "data": {"type": "LengthMismatch"}
-                })
-                
-        for s in signals:
-            if 'data' not in s:
-                return jsonify({"code": 0, "msg": f"Signal '{s.get('type')}' missing 'data' field.", "data": {"type": "InvalidSignal"}})
-            if len(s['data']) != len(df):
-                return jsonify({
-                    "code": 0, 
-                    "msg": f"Signal '{s.get('type')}' data length ({len(s['data'])}) does not match DataFrame length ({len(df)}).", 
-                    "data": {"type": "LengthMismatch"}
-                })
 
         return jsonify({
-            "code": 1, 
-            "msg": "Verification passed! Code executed successfully.", 
+            "code": 1,
+            "msg": validation["msg"],
             "data": {
-                "plots_count": len(plots),
-                "signals_count": len(signals)
+                "plots_count": validation["plots_count"],
+                "signals_count": validation["signals_count"],
+                "hints": validation.get("hints", []),
             }
         })
 
@@ -475,13 +728,14 @@ def ai_generate():
     Local-first: if OpenRouter key is not configured, we return a reasonable template.
     """
     data = request.get_json() or {}
+    lang = _request_lang()
     prompt = (data.get("prompt") or "").strip()
     existing = (data.get("existingCode") or "").strip()
 
     if not prompt:
         # Keep SSE contract (match PHP behavior) so frontend doesn't look "stuck".
         def _err_stream():
-            yield "data: " + json.dumps({"error": "提示词不能为空"}, ensure_ascii=False) + "\n\n"
+            yield "data: " + json.dumps({"error": _indicator_ai_text("prompt_required", lang)}, ensure_ascii=False) + "\n\n"
             yield "data: [DONE]\n\n"
 
         return Response(
@@ -490,53 +744,122 @@ def ai_generate():
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
 
-    # System prompt copied/adapted from the legacy PHP implementation.
+    # QuantDinger indicator IDE: chart render + backtest; must pass server verifyCode + safe_exec rules.
     SYSTEM_PROMPT = """# Role
 
-You are an expert Python quantitative trading developer. Your task is to write custom indicator or strategy scripts for a professional K-line chart component running in a browser (Pyodide environment).
+You write production-ready **QuantDinger** indicator scripts: Python that runs in the Indicator IDE, renders on the K-line chart, and drives **backtest entries/exits** via boolean signals. Code must be syntactically valid, safe for the host sandbox, and match the exact I/O contract below.
 
-# Context & Environment
+# Runtime (strict)
 
-1. **Runtime Environment**: Code runs in a browser sandbox, **network access is prohibited** (cannot use `pip` or `requests`).
+- Environment: browser-side Pyodide–style sandbox **or** API verify sandbox: **no network**, no file I/O, no subprocess.
+- **`pd` and `np` are already available.** Do **not** write `import pandas` / `import numpy`. Avoid any `import` unless unavoidable; never import `os`, `sys`, `requests`, `socket`, `subprocess`, `threading`, `sqlite3`, `multiprocessing`, or other I/O/network modules.
+- Do **not** use: `eval`, `exec`, `compile`, `open`, `__import__`, `getattr`/`setattr`/`delattr` on untrusted names, `globals`, `vars`, `dir`, or meta-programming to escape the sandbox. `locals()` is allowed if needed to assemble `output` (backtest/verify allow it); avoid `globals()`.
+- Work **vectorized** with pandas on `df` where possible; avoid O(n) Python loops over every row for core series (rolling/ewm/shift are preferred).
 
-2. **Pre-installed Libraries**: The system has already imported `pandas as pd` and `numpy as np`. **DO NOT** include `import pandas as pd` or `import numpy as np` in your generated code. Use `pd` and `np` directly.
+# Input: `df`
 
-3. **Input Data**: The system provides a variable `df` (Pandas DataFrame) with index from 0 to N.
-   - Columns include: `df['time']` (timestamp), `df['open']`, `df['high']`, `df['low']`, `df['close']`, `df['volume']`.
+- `df` is a pandas `DataFrame` aligned to K-line bars (one row per bar).
+- You **must** start mutating with: `df = df.copy()`
+- Expected columns (use `.get` or try/except only if you document optional columns): `open`, `high`, `low`, `close`, `volume`. A `time` column may exist; do not assume dtypes beyond numeric OHLCV.
+- Do not rename or drop required columns in a way that breaks length alignment.
 
-# Output Requirement (Strict)
+# Required globals (strict)
 
-At the end of code execution, you **MUST** define a dictionary variable named `output`. The system only reads this variable to render the chart.
+1. `my_indicator_name = "..."`  — short display name (can match `output['name']`).
+2. `my_indicator_description = "..."` — one line describing logic and parameters.
 
-Additionally, you MUST define:
-- my_indicator_name = "..."
-- my_indicator_description = "..."
+# Backtest contract (strict)
 
-`output` MUST follow this shape:
-output = {
-  "name": my_indicator_name,
-  "plots": [ { "name": str, "data": list, "color": "#RRGGBB", "overlay": bool, "type": "line" (optional) } ],
-  "signals": [ { "type": "buy"|"sell", "text": str, "data": list, "color": "#RRGGBB" } ] (optional),
-  "calculatedVars": {} (optional)
-}
-Where `data` lists MUST have the same length as `df` and use `None` for "no value".
+The backtest engine reads **boolean** columns on `df`:
 
-Backtest/execution compatibility (recommended):
-- Also set df['buy'] and df['sell'] as boolean columns (same length as df).
+- `df['buy']` — True on bars where a **new** long entry signal is allowed (edge-triggered).
+- `df['sell']` — True on bars where a **new** exit / short entry signal is allowed (per product semantics).
 
-# Signal confirmation / execution timing (IMPORTANT)
-- Signals are generally confirmed on bar close. The backtest engine may execute them on the next bar open to better match live trading and avoid look-ahead bias.
+Rules:
 
-# Robustness requirements (IMPORTANT)
-- Always handle NaN/inf and division-by-zero (common in RSI/BB/RSV calculations).
-- Avoid overly restrictive entry/exit logic that results in zero buy or zero sell signals.
-  For multi-indicator strategies, do NOT require a crossover AND extreme RSI on the same bar unless explicitly requested.
-- Prefer edge-triggered signals (one-shot) to avoid repeated consecutive signals:
-  buy = raw_buy.fillna(False) & (~raw_buy.shift(1).fillna(False))
-  sell = raw_sell.fillna(False) & (~raw_sell.shift(1).fillna(False))
-- If your final conditions produce no buys or no sells in the visible range, relax logically (e.g., remove one filter or widen thresholds).
+- Same **index and length** as `df`; dtype boolean (use `.astype(bool)` after fillna).
+- **Edge-trigger (mandatory)** unless the user explicitly asks for repeated signals on consecutive bars:
+  - `raw_buy = (...condition...)`
+  - `buy = raw_buy.fillna(False) & (~raw_buy.shift(1).fillna(False))`
+  - Same pattern for `raw_sell` / `sell`.
+- Signals represent **confirmation on bar close**; the engine fills on the **next bar open** (live-like). Do not implement intrabar lookahead (e.g. do not use the same bar’s `high` to validate a signal that assumes you bought at that bar’s `open` unless the user clearly wants that research mode).
+- Fill NaN from indicators before comparisons; replace division-by-zero (`replace(0, np.nan)` then fill).
 
-IMPORTANT: Output Python code directly, without explanations, without descriptions, start directly with code, and do NOT use markdown code blocks like ```python.
+# Chart output: `output` dict (strict)
+
+After computation, set:
+
+`output = { 'name': ..., 'plots': [...], 'signals': [...] }`  (use the same string keys as below)
+
+- **`name`**: str, usually `my_indicator_name`.
+- **`plots`**: list of dicts, each with:
+  - `name` (str), `data` (list, length **exactly** `len(df)`), `color` (`#RRGGBB`), `overlay` (bool).
+  - `type`: optional, e.g. `'line'`.
+  - Price-scale series (MA, Bollinger on price): `overlay: True`. Oscillators (RSI 0–100): `overlay: False`.
+- **`signals`**: optional list for markers; each item:
+  - `type`: `'buy'` or `'sell'`, `text` (short label), `color`, `data`: list length **`len(df)`**, value `None` or a float price for marker Y.
+- **`calculatedVars`**: optional dict for future UI; may be `{}` or omitted.
+
+**Length rule:** every `plot['data']` and every `signal['data']` list must have the **same length as `df`** (same as number of rows).
+
+# Optional tunable parameters: `# @param`
+
+If the indicator has knobs (periods, thresholds), declare them **once per line** at the top (after name/description or with `@strategy`):
+
+`# @param <name> <int|float|bool|str> <default> <short description>`
+
+Example: `# @param rsi_len int 14 RSI period`
+
+The runtime merges these with user-supplied params.
+
+**Critical:** `# @param` only declares parameters for the UI/runtime. It does **not**
+create Python variables automatically. If you declare:
+
+`# @param fast_period int 10 Fast MA period`
+
+you must read it explicitly in code, for example:
+
+`fast_period = params.get('fast_period', 10)`
+
+Never use declared parameter names directly unless you first assign them from `params`.
+
+# Strategy defaults: `# @strategy` (recommended)
+
+Place **after** name/description lines, **one key per line**, no extra prose on the same line:
+
+`# @strategy <key> <value>`
+
+Supported keys (parser-enforced):
+
+- `stopLossPct`, `takeProfitPct`: float **0–1** (e.g. `0.03` = 3% on margin PnL semantics as used by the engine).
+- `entryPct`: float **0.01–1.0** (fraction of capital).
+- `trailingEnabled`: `true` or `false`.
+- `trailingStopPct`, `trailingActivationPct`: float **0–1**.
+- `tradeDirection`: exactly `long`, `short`, or `both`.
+
+**Do not** put `leverage` in `@strategy`; users set leverage in the IDE backtest panel.
+
+**Do not** emit `signalTiming`; the product fixes fills to next bar open.
+
+Pick defaults that match the strategy style (trend vs mean-reversion).
+
+# Quality bar
+
+- Prefer clear variable names, short comments only where non-obvious.
+- Ensure at least some `buy` and some `sell` True in typical ranges unless the user asked for a rare signal; if logic is too strict, widen thresholds.
+- If the user asks for “display only” with no trading, still set `df['buy']`/`df['sell']` to all-False and provide plots.
+- For signal markers, prefer explicit lists with `None` for empty bars:
+  - `buy_marks = [df['low'].iloc[i] * 0.995 if bool(df['buy'].iloc[i]) else None for i in range(len(df))]`
+  - Avoid `series.where(mask, None).tolist()` for marker data because float series may still contain `NaN` instead of real `None`.
+- Before returning code, self-check:
+  1. every declared `# @param` used in code is read via `params.get(...)`
+  2. `df['buy']` and `df['sell']` are assigned boolean Series
+  3. every `plot['data']` and `signal['data']` length equals `len(df)`
+  4. `output` exists and is a dict
+
+# Output format for this chat turn
+
+Return **only** valid Python source: **no** markdown fences, **no** ` ``` `, **no** explanation before or after the code. First non-empty line should be `my_indicator_name` or a comment block with `@strategy`/`@param` immediately followed by `my_indicator_name`.
 """
 
     def _template_code() -> str:
@@ -546,9 +869,10 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
             f"my_indicator_description = \"{prompt.replace('\\n', ' ')[:200]}\"\n\n"
         )
         body = (
+            "# @param rsi_len int 14 RSI period\n\n"
+            "rsi_len = params.get('rsi_len', 14)\n"
             "df = df.copy()\n\n"
             "# Example: robust RSI with edge-triggered buy/sell (no position management, no TP/SL on chart)\n"
-            "rsi_len = 14\n"
             "delta = df['close'].diff()\n"
             "gain = delta.clip(lower=0)\n"
             "loss = (-delta).clip(lower=0)\n"
@@ -562,12 +886,12 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
             "raw_buy = (rsi < 30)\n"
             "raw_sell = (rsi > 70)\n"
             "# One-shot signals\n"
-            "buy = raw_buy.fillna(False) & (~raw_buy.shift(1).fillna(False))\n"
-            "sell = raw_sell.fillna(False) & (~raw_sell.shift(1).fillna(False))\n"
-            "df['buy'] = buy.astype(bool)\n"
-            "df['sell'] = sell.astype(bool)\n\n"
-            "buy_marks = [df['low'].iloc[i] * 0.995 if bool(buy.iloc[i]) else None for i in range(len(df))]\n"
-            "sell_marks = [df['high'].iloc[i] * 1.005 if bool(sell.iloc[i]) else None for i in range(len(df))]\n\n"
+            "buy = (raw_buy.fillna(False) & (~raw_buy.shift(1).fillna(False))).astype(bool)\n"
+            "sell = (raw_sell.fillna(False) & (~raw_sell.shift(1).fillna(False))).astype(bool)\n"
+            "df['buy'] = buy\n"
+            "df['sell'] = sell\n\n"
+            "buy_marks = [df['low'].iloc[i] * 0.995 if bool(df['buy'].iloc[i]) else None for i in range(len(df))]\n"
+            "sell_marks = [df['high'].iloc[i] * 1.005 if bool(df['sell'].iloc[i]) else None for i in range(len(df))]\n\n"
             "output = {\n"
             "  'name': my_indicator_name,\n"
             "  'plots': [\n"
@@ -591,7 +915,7 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
         
         # Get provider and model from env config (no frontend override)
         current_provider = llm.provider
-        current_model = llm.get_default_model()
+        current_model = llm.get_code_generation_model()
         current_api_key = llm.get_api_key()
         base_url = llm.get_base_url()
         
@@ -606,11 +930,12 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
         user_prompt = prompt
         if existing:
             user_prompt = (
-                "# Existing Code (modify based on this):\n\n```python\n"
+                "# Existing QuantDinger indicator code (keep working output/buy/sell contract):\n\n```python\n"
                 + existing.strip()
-                + "\n```\n\n# Modification Requirements:\n\n"
+                + "\n```\n\n# Change request:\n\n"
                 + prompt
-                + "\n\nPlease generate complete new Python code based on the existing code above and my modification requirements. Output the complete Python code directly, without explanations, without segmentation."
+                + "\n\nReturn one full replacement script: same QuantDinger rules (my_indicator_name/description, df = df.copy(), declared @param values must be read via params.get(...), df['buy']/df['sell'], output dict, list lengths == len(df)). "
+                "Python only — no markdown, no prose outside the code."
             )
 
         temperature = float(os.getenv("OPENROUTER_TEMPERATURE", "0.7") or 0.7)
@@ -622,6 +947,7 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
+            model=current_model,
             temperature=temperature,
             use_json_mode=False  # Code generation doesn't need JSON mode
         )
@@ -637,13 +963,207 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
         
         return content.strip() or _template_code()
 
-    def stream():
-        # 不扣任何 QDT：开源本地版直接生成/返回代码
+    AUTO_FIX_HINT_CODES = {
+        "DECLARED_PARAMS_NOT_READ_VIA_PARAMS_GET",
+        "SIGNAL_MARKERS_USE_WHERE_NONE",
+        "MISSING_OUTPUT",
+        "MISSING_BUY_SELL_COLUMNS",
+        "MISSING_DF_COPY",
+        "MISSING_INDICATOR_NAME",
+        "MISSING_INDICATOR_DESCRIPTION",
+        "UNKNOWN_STRATEGY_KEY",
+    }
+
+    def _needs_auto_fix(validation: Dict[str, Any]) -> bool:
+        if not validation.get("success"):
+            return True
+        for hint in validation.get("hints", []):
+            if hint.get("code") in AUTO_FIX_HINT_CODES:
+                return True
+        return False
+
+    def _format_validation_issues(validation: Dict[str, Any]) -> str:
+        issues: List[str] = []
+        if not validation.get("success"):
+            issues.append(f"- Verification failed: {validation.get('msg')}")
+            if validation.get("details"):
+                issues.append(f"- Details: {validation.get('details')}")
+        for hint in validation.get("hints", []):
+            code_name = hint.get("code") or "UNKNOWN"
+            params = hint.get("params") or {}
+            if params:
+                issues.append(f"- Hint {code_name}: {json.dumps(params, ensure_ascii=False)}")
+            else:
+                issues.append(f"- Hint {code_name}")
+        return "\n".join(issues) if issues else "- No issues provided"
+
+    def _repair_code_via_llm(bad_code: str, validation: Dict[str, Any]) -> str:
+        from app.services.llm import LLMService
+
+        llm = LLMService()
+        current_model = llm.get_code_generation_model()
+        current_api_key = llm.get_api_key()
+        if not current_api_key:
+            return bad_code
+
+        issues_text = _format_validation_issues(validation)
+        repair_prompt = (
+            "You produced QuantDinger indicator code that failed automatic validation. "
+            "Fix the code while preserving the user's trading idea and parameters. "
+            "Return one full replacement script only.\n\n"
+            f"# Original user request\n{prompt}\n\n"
+            f"# Validation issues to fix\n{issues_text}\n\n"
+            "# Current code\n```python\n"
+            + bad_code.strip()
+            + "\n```\n\n"
+            "# Repair requirements\n"
+            "- Keep QuantDinger indicator contract intact.\n"
+            "- If code declares # @param, read each declared param via params.get(...).\n"
+            "- Ensure df['buy'] and df['sell'] are boolean Series.\n"
+            "- Ensure output exists and all plot/signal data lengths equal len(df).\n"
+            "- For signal markers, prefer explicit None-or-price lists, not .where(..., None).tolist().\n"
+            "- Return Python only, no markdown, no explanation."
+        )
+
+        content = llm.call_llm_api(
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": repair_prompt},
+            ],
+            model=current_model,
+            temperature=0.2,
+            use_json_mode=False,
+        )
+
+        content = (content or "").strip()
+        if content.startswith("```python"):
+            content = content[9:]
+        elif content.startswith("```"):
+            content = content[3:]
+        if content.endswith("```"):
+            content = content[:-3]
+        return content.strip() or bad_code
+
+    def _generate_final_code() -> tuple[str, Dict[str, Any]]:
         try:
             code_text = _generate_code_via_llm()
         except Exception as e:
             logger.error(f"ai_generate LLM failed, fallback to template. Error: {type(e).__name__}: {e}")
             code_text = _template_code()
+
+        validation = _validate_indicator_code_internal(code_text)
+        if not _needs_auto_fix(validation):
+            debug = {
+                "auto_fix_applied": False,
+                "auto_fix_succeeded": False,
+                "returned_candidate": "initial",
+                "initial_validation": _indicator_debug_summary(validation),
+                "final_validation": _indicator_debug_summary(validation),
+            }
+            debug["human_summary"] = _indicator_human_summary(
+                validation, validation, False, False, "initial", lang=lang
+            )
+            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            return code_text, debug
+
+        logger.warning("ai_generate produced code needing auto-fix: %s", _format_validation_issues(validation))
+        try:
+            repaired = _repair_code_via_llm(code_text, validation)
+        except Exception as e:
+            logger.error(f"ai_generate auto-fix failed, returning first pass. Error: {type(e).__name__}: {e}")
+            debug = {
+                "auto_fix_applied": True,
+                "auto_fix_succeeded": False,
+                "returned_candidate": "initial",
+                "initial_validation": _indicator_debug_summary(validation),
+                "final_validation": _indicator_debug_summary(validation),
+                "auto_fix_error": str(e),
+            }
+            debug["human_summary"] = _indicator_human_summary(
+                validation, validation, True, False, "initial", lang=lang
+            )
+            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            return code_text, debug
+
+        repaired_validation = _validate_indicator_code_internal(repaired)
+        if repaired_validation.get("success") and not _needs_auto_fix(repaired_validation):
+            logger.info("ai_generate auto-fix succeeded")
+            debug = {
+                "auto_fix_applied": True,
+                "auto_fix_succeeded": True,
+                "returned_candidate": "repaired",
+                "initial_validation": _indicator_debug_summary(validation),
+                "final_validation": _indicator_debug_summary(repaired_validation),
+            }
+            debug["human_summary"] = _indicator_human_summary(
+                validation, repaired_validation, True, True, "repaired", lang=lang
+            )
+            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            return repaired, debug
+
+        repaired_hint_codes = {h.get("code") for h in repaired_validation.get("hints", [])}
+        if repaired_validation.get("success"):
+            logger.warning("ai_generate auto-fix improved code but some non-blocking issues remain")
+            debug = {
+                "auto_fix_applied": True,
+                "auto_fix_succeeded": True,
+                "returned_candidate": "repaired",
+                "initial_validation": _indicator_debug_summary(validation),
+                "final_validation": _indicator_debug_summary(repaired_validation),
+            }
+            debug["human_summary"] = _indicator_human_summary(
+                validation, repaired_validation, True, True, "repaired", lang=lang
+            )
+            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            return repaired, debug
+
+        if repaired_hint_codes.intersection(AUTO_FIX_HINT_CODES):
+            logger.warning("ai_generate auto-fix still has blocking issues, returning first pass")
+            debug = {
+                "auto_fix_applied": True,
+                "auto_fix_succeeded": False,
+                "returned_candidate": "initial",
+                "initial_validation": _indicator_debug_summary(validation),
+                "final_validation": _indicator_debug_summary(repaired_validation),
+            }
+            debug["human_summary"] = _indicator_human_summary(
+                validation, repaired_validation, True, False, "initial", lang=lang
+            )
+            logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+            return code_text, debug
+
+        debug = {
+            "auto_fix_applied": True,
+            "auto_fix_succeeded": False,
+            "returned_candidate": "repaired",
+            "initial_validation": _indicator_debug_summary(validation),
+            "final_validation": _indicator_debug_summary(repaired_validation),
+        }
+        debug["human_summary"] = _indicator_human_summary(
+            validation, repaired_validation, True, False, "repaired", lang=lang
+        )
+        logger.info("ai_generate debug=%s", json.dumps(debug, ensure_ascii=False))
+        return repaired, debug
+
+    # Capture user_id before generator runs (generator executes outside request context)
+    user_id = g.user_id
+    def stream():
+        from app.services.billing_service import get_billing_service
+        billing = get_billing_service()
+        ok, msg = billing.check_and_consume(
+            user_id=user_id,
+            feature='ai_code_gen',
+            reference_id=f"ai_code_gen_{user_id}_{int(time.time())}"
+        )
+        if not ok:
+            error_msg = f"积分不足: {msg}" if _is_zh_lang(lang) and msg else _indicator_ai_text("insufficient_credits", lang)
+            yield "data: " + json.dumps({"error": error_msg}, ensure_ascii=False) + "\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        code_text, debug_info = _generate_final_code()
+
+        yield "data: " + json.dumps({"debug": debug_info}, ensure_ascii=False) + "\n\n"
 
         # Stream in chunks (front-end appends).
         chunk_size = 200
@@ -660,6 +1180,46 @@ IMPORTANT: Output Python code directly, without explanations, without descriptio
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@indicator_bp.route("/codeQualityHints", methods=["POST"])
+@login_required
+def code_quality_hints():
+    """
+    Heuristic hints for indicator code (structure, @strategy risk/position).
+    POST /api/indicator/codeQualityHints
+    Body: { "code": "..." }
+    Returns: { "code": 1, "data": { "hints": [ { "severity", "code", "params" } ] } }
+    """
+    from app.services.indicator_code_quality import analyze_indicator_code_quality
+
+    data = request.get_json() or {}
+    code_str = data.get("code") or ""
+    hints = analyze_indicator_code_quality(code_str)
+    return jsonify({"code": 1, "data": {"hints": hints}})
+
+
+@indicator_bp.route("/parseStrategyConfig", methods=["POST"])
+@login_required
+def parse_strategy_config():
+    """
+    Parse @strategy annotations from indicator code and return strategy config.
+    POST /api/indicator/parseStrategyConfig
+    Body: { "code": "..." }
+    Returns: { "code": 1, "data": { "strategyConfig": {...}, "indicatorParams": [...] } }
+    """
+    from app.services.indicator_params import StrategyConfigParser, IndicatorParamsParser
+    data = request.get_json() or {}
+    code_str = (data.get("code") or "").strip()
+    strategy_cfg = StrategyConfigParser.parse(code_str) if code_str else {}
+    indicator_params = IndicatorParamsParser.parse_params(code_str) if code_str else []
+    return jsonify({
+        "code": 1,
+        "data": {
+            "strategyConfig": strategy_cfg,
+            "indicatorParams": indicator_params
+        }
+    })
 
 
 @indicator_bp.route("/callIndicator", methods=["POST"])

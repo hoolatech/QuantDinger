@@ -16,9 +16,14 @@ CREATE TABLE IF NOT EXISTS qd_users (
     role VARCHAR(20) DEFAULT 'user',       -- admin/manager/user/viewer
     credits DECIMAL(20,2) DEFAULT 0,       -- 积分余额
     vip_expires_at TIMESTAMP,              -- VIP过期时间
+    vip_plan VARCHAR(20) DEFAULT '',       -- VIP套餐：monthly/yearly/lifetime
+    vip_is_lifetime BOOLEAN DEFAULT FALSE, -- 是否永久会员
+    vip_monthly_credits_last_grant TIMESTAMP, -- 永久会员上次发放月度积分时间
     email_verified BOOLEAN DEFAULT FALSE,  -- 邮箱是否已验证
     referred_by INTEGER,                   -- 邀请人ID
     notification_settings TEXT DEFAULT '', -- 用户通知配置 JSON (telegram_chat_id, default_channels等)
+    chart_templates TEXT DEFAULT '',      -- 用户图表模板 JSON（指标布局/样式）
+    timezone VARCHAR(64) DEFAULT '',       -- IANA 时区标识，空表示跟随客户端/浏览器
     token_version INTEGER DEFAULT 1,       -- Token版本号，用于单一客户端登录控制
     last_login_at TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW(),
@@ -50,6 +55,47 @@ CREATE TABLE IF NOT EXISTS qd_credits_log (
 CREATE INDEX IF NOT EXISTS idx_credits_log_user_id ON qd_credits_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_credits_log_action ON qd_credits_log(action);
 CREATE INDEX IF NOT EXISTS idx_credits_log_created_at ON qd_credits_log(created_at);
+
+-- =============================================================================
+-- 1.55. Membership Orders (会员订单 - Mock支付)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS qd_membership_orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    plan VARCHAR(20) NOT NULL,             -- monthly/yearly/lifetime
+    price_usd DECIMAL(10,2) DEFAULT 0,     -- 订单金额（USD）
+    status VARCHAR(20) DEFAULT 'paid',     -- paid/pending/failed/refunded (mock 默认 paid)
+    created_at TIMESTAMP DEFAULT NOW(),
+    paid_at TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_membership_orders_user_id ON qd_membership_orders(user_id);
+
+-- =============================================================================
+-- 1.56. USDT Orders (USDT 收款订单 - 每单独立地址)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS qd_usdt_orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    plan VARCHAR(20) NOT NULL,                 -- monthly/yearly/lifetime
+    chain VARCHAR(20) NOT NULL DEFAULT 'TRC20',-- TRC20 (MVP)
+    amount_usdt DECIMAL(20,6) NOT NULL DEFAULT 0,
+    address_index INTEGER NOT NULL DEFAULT 0,  -- HD 派生索引
+    address VARCHAR(80) NOT NULL DEFAULT '',
+    status VARCHAR(20) NOT NULL DEFAULT 'pending', -- pending/paid/confirmed/expired/cancelled/failed
+    tx_hash VARCHAR(120) DEFAULT '',
+    paid_at TIMESTAMP,
+    confirmed_at TIMESTAMP,
+    expires_at TIMESTAMP,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_usdt_orders_address_unique ON qd_usdt_orders(chain, address);
+CREATE INDEX IF NOT EXISTS idx_usdt_orders_user_id ON qd_usdt_orders(user_id);
+CREATE INDEX IF NOT EXISTS idx_usdt_orders_status ON qd_usdt_orders(status);
 
 -- =============================================================================
 -- 1.6. Verification Codes (邮箱验证码)
@@ -154,6 +200,8 @@ CREATE TABLE IF NOT EXISTS qd_strategies_trading (
     decide_interval INTEGER DEFAULT 300,
     strategy_group_id VARCHAR(100) DEFAULT '',
     group_base_name VARCHAR(255) DEFAULT '',
+    strategy_mode VARCHAR(20) DEFAULT 'signal',
+    strategy_code TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -161,6 +209,25 @@ CREATE TABLE IF NOT EXISTS qd_strategies_trading (
 CREATE INDEX IF NOT EXISTS idx_strategies_user_id ON qd_strategies_trading(user_id);
 CREATE INDEX IF NOT EXISTS idx_strategies_status ON qd_strategies_trading(status);
 CREATE INDEX IF NOT EXISTS idx_strategies_group_id ON qd_strategies_trading(strategy_group_id);
+
+-- Add strategy_mode and strategy_code columns (script strategy support)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_strategies_trading' AND column_name = 'strategy_mode'
+    ) THEN
+        ALTER TABLE qd_strategies_trading ADD COLUMN strategy_mode VARCHAR(20) DEFAULT 'signal';
+        RAISE NOTICE 'Added strategy_mode column to qd_strategies_trading';
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_strategies_trading' AND column_name = 'strategy_code'
+    ) THEN
+        ALTER TABLE qd_strategies_trading ADD COLUMN strategy_code TEXT DEFAULT '';
+        RAISE NOTICE 'Added strategy_code column to qd_strategies_trading';
+    END IF;
+END$$;
 
 -- Add last_rebalance_at column for cross-sectional strategies (if not exists)
 DO $$
@@ -284,6 +351,21 @@ CREATE INDEX IF NOT EXISTS idx_notifications_strategy_id ON qd_strategy_notifica
 CREATE INDEX IF NOT EXISTS idx_notifications_is_read ON qd_strategy_notifications(is_read);
 
 -- =============================================================================
+-- 6b. Strategy runtime logs (dashboard / API)
+-- =============================================================================
+
+CREATE TABLE IF NOT EXISTS qd_strategy_logs (
+    id SERIAL PRIMARY KEY,
+    strategy_id INTEGER NOT NULL REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
+    level VARCHAR(20) DEFAULT 'info',
+    message TEXT NOT NULL,
+    timestamp TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_strategy_logs_strategy_id ON qd_strategy_logs(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_strategy_logs_timestamp ON qd_strategy_logs(timestamp);
+
+-- =============================================================================
 -- 7. Indicator Codes
 -- =============================================================================
 
@@ -300,6 +382,7 @@ CREATE TABLE IF NOT EXISTS qd_indicator_codes (
    price numeric(10, 2) DEFAULT 0 NOT NULL,
    is_encrypted int4 DEFAULT 0 NOT NULL,
    preview_image varchar(500) DEFAULT ''::character varying NULL,
+   vip_free boolean DEFAULT false, -- VIP免费指标：VIP可免扣积分使用
    createtime int8 NULL,
    updatetime int8 NULL,
    created_at timestamp DEFAULT now(),
@@ -319,31 +402,6 @@ CREATE TABLE IF NOT EXISTS qd_indicator_codes (
 
 CREATE INDEX IF NOT EXISTS idx_indicator_codes_user_id ON qd_indicator_codes USING btree (user_id);
 CREATE INDEX IF NOT EXISTS idx_indicator_review_status ON qd_indicator_codes USING btree (review_status);
-
--- =============================================================================
--- 8. AI Decisions
--- =============================================================================
-
-CREATE TABLE IF NOT EXISTS qd_ai_decisions (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
-    strategy_id INTEGER REFERENCES qd_strategies_trading(id) ON DELETE CASCADE,
-    decision_data TEXT,
-    context_data TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_ai_decisions_user_id ON qd_ai_decisions(user_id);
-
--- =============================================================================
--- 9. Addon Config
--- =============================================================================
-
-CREATE TABLE IF NOT EXISTS qd_addon_config (
-    config_key VARCHAR(100) PRIMARY KEY,
-    config_value TEXT,
-    type VARCHAR(20) DEFAULT 'string'
-);
 
 -- =============================================================================
 -- 10. Watchlist
@@ -390,6 +448,9 @@ CREATE TABLE IF NOT EXISTS qd_backtest_runs (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
     indicator_id INTEGER,
+    strategy_id INTEGER,
+    strategy_name VARCHAR(255) DEFAULT '',
+    run_type VARCHAR(50) DEFAULT 'indicator',
     market VARCHAR(50) NOT NULL DEFAULT '',
     symbol VARCHAR(50) NOT NULL DEFAULT '',
     timeframe VARCHAR(10) NOT NULL DEFAULT '',
@@ -401,6 +462,9 @@ CREATE TABLE IF NOT EXISTS qd_backtest_runs (
     leverage INTEGER DEFAULT 1,
     trade_direction VARCHAR(20) DEFAULT 'long',
     strategy_config TEXT DEFAULT '',
+    config_snapshot TEXT DEFAULT '',
+    engine_version VARCHAR(50) DEFAULT '',
+    code_hash VARCHAR(128) DEFAULT '',
     status VARCHAR(20) DEFAULT 'success',
     error_message TEXT DEFAULT '',
     result_json TEXT DEFAULT '',
@@ -409,6 +473,39 @@ CREATE TABLE IF NOT EXISTS qd_backtest_runs (
 
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_user_id ON qd_backtest_runs(user_id);
 CREATE INDEX IF NOT EXISTS idx_backtest_runs_indicator_id ON qd_backtest_runs(indicator_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_strategy_id ON qd_backtest_runs(strategy_id);
+CREATE INDEX IF NOT EXISTS idx_backtest_runs_run_type ON qd_backtest_runs(run_type);
+
+CREATE TABLE IF NOT EXISTS qd_backtest_trades (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL DEFAULT 1 REFERENCES qd_users(id) ON DELETE CASCADE,
+    strategy_id INTEGER,
+    trade_index INTEGER DEFAULT 0,
+    trade_time VARCHAR(64) DEFAULT '',
+    trade_type VARCHAR(64) DEFAULT '',
+    side VARCHAR(32) DEFAULT '',
+    price DOUBLE PRECISION DEFAULT 0,
+    amount DOUBLE PRECISION DEFAULT 0,
+    profit DOUBLE PRECISION DEFAULT 0,
+    balance DOUBLE PRECISION DEFAULT 0,
+    reason VARCHAR(64) DEFAULT '',
+    payload_json TEXT DEFAULT '',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_trades_run_id ON qd_backtest_trades(run_id);
+
+CREATE TABLE IF NOT EXISTS qd_backtest_equity_points (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    point_index INTEGER DEFAULT 0,
+    point_time VARCHAR(64) DEFAULT '',
+    point_value DOUBLE PRECISION DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_backtest_equity_points_run_id ON qd_backtest_equity_points(run_id);
 
 -- =============================================================================
 -- 13. Exchange Credentials
@@ -523,17 +620,6 @@ CREATE INDEX IF NOT EXISTS idx_market_symbols_is_hot ON qd_market_symbols(market
 
 -- Seed data: Hot symbols for each market
 INSERT INTO qd_market_symbols (market, symbol, name, exchange, currency, is_active, is_hot, sort_order) VALUES
--- AShare (China A-Shares)
-('AShare', '000001', '平安银行', 'SZSE', 'CNY', 1, 1, 100),
-('AShare', '000002', '万科A', 'SZSE', 'CNY', 1, 1, 99),
-('AShare', '600000', '浦发银行', 'SSE', 'CNY', 1, 1, 98),
-('AShare', '600036', '招商银行', 'SSE', 'CNY', 1, 1, 97),
-('AShare', '600519', '贵州茅台', 'SSE', 'CNY', 1, 1, 96),
-('AShare', '000858', '五粮液', 'SZSE', 'CNY', 1, 1, 95),
-('AShare', '002415', '海康威视', 'SZSE', 'CNY', 1, 1, 94),
-('AShare', '300059', '东方财富', 'SZSE', 'CNY', 1, 1, 93),
-('AShare', '000725', '京东方A', 'SZSE', 'CNY', 1, 1, 92),
-('AShare', '002594', '比亚迪', 'SZSE', 'CNY', 1, 1, 91),
 -- USStock (US Stocks)
 ('USStock', 'AAPL', 'Apple Inc.', 'NASDAQ', 'USD', 1, 1, 100),
 ('USStock', 'MSFT', 'Microsoft Corporation', 'NASDAQ', 'USD', 1, 1, 99),
@@ -545,18 +631,7 @@ INSERT INTO qd_market_symbols (market, symbol, name, exchange, currency, is_acti
 ('USStock', 'JPM', 'JPMorgan Chase & Co.', 'NYSE', 'USD', 1, 1, 93),
 ('USStock', 'V', 'Visa Inc.', 'NYSE', 'USD', 1, 1, 92),
 ('USStock', 'JNJ', 'Johnson & Johnson', 'NYSE', 'USD', 1, 1, 91),
--- HShare (Hong Kong Stocks)
-('HShare', '00700', 'Tencent Holdings', 'HKEX', 'HKD', 1, 1, 100),
-('HShare', '09988', 'Alibaba Group', 'HKEX', 'HKD', 1, 1, 99),
-('HShare', '03690', 'Meituan', 'HKEX', 'HKD', 1, 1, 98),
-('HShare', '01810', 'Xiaomi Corporation', 'HKEX', 'HKD', 1, 1, 97),
-('HShare', '02318', 'Ping An Insurance', 'HKEX', 'HKD', 1, 1, 96),
-('HShare', '01398', 'ICBC', 'HKEX', 'HKD', 1, 1, 95),
-('HShare', '00939', 'CCB', 'HKEX', 'HKD', 1, 1, 94),
-('HShare', '01299', 'AIA Group', 'HKEX', 'HKD', 1, 1, 93),
-('HShare', '02020', 'Anta Sports', 'HKEX', 'HKD', 1, 1, 92),
-('HShare', '01024', 'Kuaishou Technology', 'HKEX', 'HKD', 1, 1, 91),
--- Crypto
+-- Crypto (major + popular altcoins)
 ('Crypto', 'BTC/USDT', 'Bitcoin', 'Binance', 'USDT', 1, 1, 100),
 ('Crypto', 'ETH/USDT', 'Ethereum', 'Binance', 'USDT', 1, 1, 99),
 ('Crypto', 'BNB/USDT', 'BNB', 'Binance', 'USDT', 1, 1, 98),
@@ -565,8 +640,74 @@ INSERT INTO qd_market_symbols (market, symbol, name, exchange, currency, is_acti
 ('Crypto', 'ADA/USDT', 'Cardano', 'Binance', 'USDT', 1, 1, 95),
 ('Crypto', 'DOGE/USDT', 'Dogecoin', 'Binance', 'USDT', 1, 1, 94),
 ('Crypto', 'DOT/USDT', 'Polkadot', 'Binance', 'USDT', 1, 1, 93),
-('Crypto', 'MATIC/USDT', 'Polygon', 'Binance', 'USDT', 1, 1, 92),
+('Crypto', 'POL/USDT', 'Polygon', 'Binance', 'USDT', 1, 1, 92),
 ('Crypto', 'AVAX/USDT', 'Avalanche', 'Binance', 'USDT', 1, 1, 91),
+-- Layer 1 / Layer 2
+('Crypto', 'LINK/USDT', 'Chainlink', 'Binance', 'USDT', 1, 1, 90),
+('Crypto', 'UNI/USDT', 'Uniswap', 'Binance', 'USDT', 1, 1, 89),
+('Crypto', 'ATOM/USDT', 'Cosmos', 'Binance', 'USDT', 1, 1, 88),
+('Crypto', 'LTC/USDT', 'Litecoin', 'Binance', 'USDT', 1, 1, 87),
+('Crypto', 'FIL/USDT', 'Filecoin', 'Binance', 'USDT', 1, 1, 86),
+('Crypto', 'NEAR/USDT', 'NEAR Protocol', 'Binance', 'USDT', 1, 1, 85),
+('Crypto', 'APT/USDT', 'Aptos', 'Binance', 'USDT', 1, 1, 84),
+('Crypto', 'SUI/USDT', 'Sui', 'Binance', 'USDT', 1, 1, 83),
+('Crypto', 'ARB/USDT', 'Arbitrum', 'Binance', 'USDT', 1, 1, 82),
+('Crypto', 'OP/USDT', 'Optimism', 'Binance', 'USDT', 1, 1, 81),
+('Crypto', 'SEI/USDT', 'Sei', 'Binance', 'USDT', 1, 1, 80),
+('Crypto', 'TIA/USDT', 'Celestia', 'Binance', 'USDT', 1, 1, 79),
+('Crypto', 'INJ/USDT', 'Injective', 'Binance', 'USDT', 1, 1, 78),
+('Crypto', 'FTM/USDT', 'Fantom', 'Binance', 'USDT', 1, 1, 77),
+('Crypto', 'ALGO/USDT', 'Algorand', 'Binance', 'USDT', 1, 1, 76),
+('Crypto', 'HBAR/USDT', 'Hedera', 'Binance', 'USDT', 1, 1, 75),
+('Crypto', 'ICP/USDT', 'Internet Computer', 'Binance', 'USDT', 1, 1, 74),
+('Crypto', 'VET/USDT', 'VeChain', 'Binance', 'USDT', 1, 1, 73),
+('Crypto', 'SAND/USDT', 'The Sandbox', 'Binance', 'USDT', 1, 1, 72),
+('Crypto', 'MANA/USDT', 'Decentraland', 'Binance', 'USDT', 1, 1, 71),
+-- DeFi
+('Crypto', 'AAVE/USDT', 'Aave', 'Binance', 'USDT', 1, 1, 70),
+('Crypto', 'MKR/USDT', 'Maker', 'Binance', 'USDT', 1, 1, 69),
+('Crypto', 'CRV/USDT', 'Curve DAO', 'Binance', 'USDT', 1, 1, 68),
+('Crypto', 'COMP/USDT', 'Compound', 'Binance', 'USDT', 1, 1, 67),
+('Crypto', 'SNX/USDT', 'Synthetix', 'Binance', 'USDT', 1, 1, 66),
+('Crypto', 'SUSHI/USDT', 'SushiSwap', 'Binance', 'USDT', 1, 1, 65),
+('Crypto', 'DYDX/USDT', 'dYdX', 'Binance', 'USDT', 1, 1, 64),
+('Crypto', 'LDO/USDT', 'Lido DAO', 'Binance', 'USDT', 1, 1, 63),
+('Crypto', 'PENDLE/USDT', 'Pendle', 'Binance', 'USDT', 1, 1, 62),
+('Crypto', 'JUP/USDT', 'Jupiter', 'Binance', 'USDT', 1, 1, 61),
+-- Meme coins
+('Crypto', 'SHIB/USDT', 'Shiba Inu', 'Binance', 'USDT', 1, 1, 60),
+('Crypto', 'PEPE/USDT', 'Pepe', 'Binance', 'USDT', 1, 1, 59),
+('Crypto', 'WIF/USDT', 'dogwifhat', 'Binance', 'USDT', 1, 1, 58),
+('Crypto', 'FLOKI/USDT', 'Floki', 'Binance', 'USDT', 1, 1, 57),
+('Crypto', 'BONK/USDT', 'Bonk', 'Binance', 'USDT', 1, 1, 56),
+('Crypto', 'MEME/USDT', 'Memecoin', 'Binance', 'USDT', 1, 1, 55),
+('Crypto', 'TURBO/USDT', 'Turbo', 'Binance', 'USDT', 1, 1, 54),
+('Crypto', 'NEIRO/USDT', 'Neiro', 'Binance', 'USDT', 1, 1, 53),
+-- AI / Infra
+('Crypto', 'RENDER/USDT', 'Render', 'Binance', 'USDT', 1, 1, 52),
+('Crypto', 'FET/USDT', 'Fetch.ai', 'Binance', 'USDT', 1, 1, 51),
+('Crypto', 'RNDR/USDT', 'Render Network', 'Binance', 'USDT', 1, 1, 50),
+('Crypto', 'TAO/USDT', 'Bittensor', 'Binance', 'USDT', 1, 1, 49),
+('Crypto', 'WLD/USDT', 'Worldcoin', 'Binance', 'USDT', 1, 1, 48),
+('Crypto', 'AR/USDT', 'Arweave', 'Binance', 'USDT', 1, 1, 47),
+('Crypto', 'STX/USDT', 'Stacks', 'Binance', 'USDT', 1, 1, 46),
+('Crypto', 'ORDI/USDT', 'ORDI', 'Binance', 'USDT', 1, 1, 45),
+-- Others
+('Crypto', 'TRX/USDT', 'Tron', 'Binance', 'USDT', 1, 1, 44),
+('Crypto', 'ETC/USDT', 'Ethereum Classic', 'Binance', 'USDT', 1, 1, 43),
+('Crypto', 'THETA/USDT', 'Theta Network', 'Binance', 'USDT', 1, 1, 42),
+('Crypto', 'EOS/USDT', 'EOS', 'Binance', 'USDT', 1, 1, 41),
+('Crypto', 'XLM/USDT', 'Stellar', 'Binance', 'USDT', 1, 1, 40),
+('Crypto', 'GALA/USDT', 'Gala', 'Binance', 'USDT', 1, 1, 39),
+('Crypto', 'IMX/USDT', 'Immutable X', 'Binance', 'USDT', 1, 1, 38),
+('Crypto', 'CFX/USDT', 'Conflux', 'Binance', 'USDT', 1, 1, 37),
+('Crypto', 'JASMY/USDT', 'JasmyCoin', 'Binance', 'USDT', 1, 1, 36),
+('Crypto', 'CHZ/USDT', 'Chiliz', 'Binance', 'USDT', 1, 1, 35),
+('Crypto', 'GMT/USDT', 'STEPN', 'Binance', 'USDT', 1, 1, 34),
+('Crypto', 'CAKE/USDT', 'PancakeSwap', 'Binance', 'USDT', 1, 1, 33),
+('Crypto', '1INCH/USDT', '1inch', 'Binance', 'USDT', 1, 1, 32),
+('Crypto', 'ENS/USDT', 'Ethereum Name Service', 'Binance', 'USDT', 1, 1, 31),
+('Crypto', 'BLUR/USDT', 'Blur', 'Binance', 'USDT', 1, 1, 30),
 -- Forex
 ('Forex', 'XAUUSD', 'Gold/USD', 'Forex', 'USD', 1, 1, 100),
 ('Forex', 'XAGUSD', 'Silver/USD', 'Forex', 'USD', 1, 1, 99),
@@ -588,58 +729,30 @@ INSERT INTO qd_market_symbols (market, symbol, name, exchange, currency, is_acti
 ('Futures', 'ZS', 'Soybeans', 'CBOT', 'USD', 1, 1, 94),
 ('Futures', 'ZW', 'Wheat', 'CBOT', 'USD', 1, 1, 93),
 ('Futures', 'ES', 'S&P 500 E-mini', 'CME', 'USD', 1, 1, 92),
-('Futures', 'NQ', 'NASDAQ 100 E-mini', 'CME', 'USD', 1, 1, 91)
+('Futures', 'NQ', 'NASDAQ 100 E-mini', 'CME', 'USD', 1, 1, 91),
+-- A股 (CNStock)
+('CNStock', '600519', '贵州茅台', 'SSE', 'CNY', 1, 1, 100),
+('CNStock', '600036', '招商银行', 'SSE', 'CNY', 1, 1, 99),
+('CNStock', '601318', '中国平安', 'SSE', 'CNY', 1, 1, 98),
+('CNStock', '600900', '长江电力', 'SSE', 'CNY', 1, 1, 97),
+('CNStock', '601899', '紫金矿业', 'SSE', 'CNY', 1, 1, 96),
+('CNStock', '000858', '五粮液', 'SZSE', 'CNY', 1, 1, 95),
+('CNStock', '000333', '美的集团', 'SZSE', 'CNY', 1, 1, 94),
+('CNStock', '002594', '比亚迪', 'SZSE', 'CNY', 1, 1, 93),
+('CNStock', '300750', '宁德时代', 'SZSE', 'CNY', 1, 1, 92),
+('CNStock', '000001', '平安银行', 'SZSE', 'CNY', 1, 1, 91),
+-- 港股/H股 (HKStock)
+('HKStock', '00700', '腾讯控股', 'HKEX', 'HKD', 1, 1, 100),
+('HKStock', '09988', '阿里巴巴-W', 'HKEX', 'HKD', 1, 1, 99),
+('HKStock', '03690', '美团-W', 'HKEX', 'HKD', 1, 1, 98),
+('HKStock', '01810', '小米集团-W', 'HKEX', 'HKD', 1, 1, 97),
+('HKStock', '00939', '建设银行', 'HKEX', 'HKD', 1, 1, 96),
+('HKStock', '01299', '友邦保险', 'HKEX', 'HKD', 1, 1, 95),
+('HKStock', '02318', '中国平安', 'HKEX', 'HKD', 1, 1, 94),
+('HKStock', '00388', '香港交易所', 'HKEX', 'HKD', 1, 1, 93),
+('HKStock', '00883', '中国海洋石油', 'HKEX', 'HKD', 1, 1, 92),
+('HKStock', '01398', '工商银行', 'HKEX', 'HKD', 1, 1, 91)
 ON CONFLICT (market, symbol) DO NOTHING;
-
--- =============================================================================
--- 18. Agent Memories (AI Learning System)
--- =============================================================================
--- Stores agent decision experiences for RAG-style retrieval during analysis.
--- Each agent (trader, risk_analyst, etc.) shares this table but is identified by agent_name.
-
-CREATE TABLE IF NOT EXISTS qd_agent_memories (
-    id SERIAL PRIMARY KEY,
-    agent_name VARCHAR(100) NOT NULL,
-    situation TEXT NOT NULL,
-    recommendation TEXT NOT NULL,
-    result TEXT,
-    returns REAL,
-    market VARCHAR(50),
-    symbol VARCHAR(50),
-    timeframe VARCHAR(20),
-    features_json TEXT,
-    embedding BYTEA,
-    created_at TIMESTAMP DEFAULT NOW(),
-    updated_at TIMESTAMP DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_agent_memories_agent ON qd_agent_memories(agent_name);
-CREATE INDEX IF NOT EXISTS idx_agent_memories_created ON qd_agent_memories(agent_name, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_agent_memories_market ON qd_agent_memories(agent_name, market, symbol);
-
--- =============================================================================
--- 19. Reflection Records (AI Auto-Verification System)
--- =============================================================================
--- Records analysis predictions for future auto-verification and closed-loop learning.
-
-CREATE TABLE IF NOT EXISTS qd_reflection_records (
-    id SERIAL PRIMARY KEY,
-    market VARCHAR(50) NOT NULL,
-    symbol VARCHAR(50) NOT NULL,
-    initial_price REAL,
-    decision VARCHAR(20),
-    confidence INTEGER,
-    reasoning TEXT,
-    analysis_date TIMESTAMP DEFAULT NOW(),
-    target_check_date TIMESTAMP,
-    status VARCHAR(20) DEFAULT 'PENDING',
-    final_price REAL,
-    actual_return REAL,
-    check_result TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_reflection_status ON qd_reflection_records(status, target_check_date);
-CREATE INDEX IF NOT EXISTS idx_reflection_market ON qd_reflection_records(market, symbol);
 
 -- =============================================================================
 -- 19.5. Analysis Memory (Fast AI Analysis Memory System)
@@ -654,15 +767,15 @@ CREATE TABLE IF NOT EXISTS qd_analysis_memory (
     decision VARCHAR(10) NOT NULL,
     confidence INT DEFAULT 50,
     price_at_analysis DECIMAL(24, 8),
-    entry_price DECIMAL(24, 8),
-    stop_loss DECIMAL(24, 8),
-    take_profit DECIMAL(24, 8),
     summary TEXT,
     reasons JSONB,
-    risks JSONB,
     scores JSONB,
     indicators_snapshot JSONB,
     raw_result JSONB,                           -- Full analysis result for history replay
+    consensus_score DECIMAL(24, 8),
+    consensus_abs DECIMAL(24, 8),
+    agreement_ratio DECIMAL(10, 6),
+    quality_multiplier DECIMAL(10, 6),
     created_at TIMESTAMP DEFAULT NOW(),
     validated_at TIMESTAMP,
     actual_outcome VARCHAR(20),
@@ -705,6 +818,21 @@ BEGIN
     ) THEN
         ALTER TABLE qd_users ADD COLUMN token_version INTEGER DEFAULT 1;
         RAISE NOTICE 'Added token_version column to qd_users table';
+    END IF;
+END $$;
+
+-- =============================================================================
+-- 20b. Migration: user profile timezone (IANA)
+-- =============================================================================
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'qd_users' AND column_name = 'timezone'
+    ) THEN
+        ALTER TABLE qd_users ADD COLUMN timezone VARCHAR(64) DEFAULT '';
+        RAISE NOTICE 'Added timezone column to qd_users table';
     END IF;
 END $$;
 
@@ -778,6 +906,98 @@ BEGIN
         RAISE NOTICE 'Added view_count column to qd_indicator_codes';
     END IF;
 END $$;
+
+-- =============================================================================
+-- Quick Trades (manual / discretionary orders from Quick Trade Panel)
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS qd_quick_trades (
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES qd_users(id) ON DELETE CASCADE,
+    credential_id   INTEGER DEFAULT 0,
+    exchange_id     VARCHAR(40) NOT NULL DEFAULT '',
+    symbol          VARCHAR(60) NOT NULL DEFAULT '',
+    side            VARCHAR(10) NOT NULL DEFAULT '',       -- buy / sell
+    order_type      VARCHAR(20) NOT NULL DEFAULT 'market', -- market / limit
+    amount          DECIMAL(24, 8) DEFAULT 0,
+    price           DECIMAL(24, 8) DEFAULT 0,
+    leverage        INTEGER DEFAULT 1,
+    market_type     VARCHAR(20) DEFAULT 'swap',            -- swap / spot
+    tp_price        DECIMAL(24, 8) DEFAULT 0,
+    sl_price        DECIMAL(24, 8) DEFAULT 0,
+    status          VARCHAR(20) DEFAULT 'submitted',       -- submitted / filled / failed / cancelled
+    exchange_order_id VARCHAR(120) DEFAULT '',
+    filled_amount   DECIMAL(24, 8) DEFAULT 0,
+    avg_fill_price  DECIMAL(24, 8) DEFAULT 0,
+    error_msg       TEXT DEFAULT '',
+    source          VARCHAR(40) DEFAULT 'manual',          -- ai_radar / ai_analysis / indicator / manual
+    raw_result      JSONB,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_quick_trades_user    ON qd_quick_trades(user_id);
+CREATE INDEX IF NOT EXISTS idx_quick_trades_created ON qd_quick_trades(created_at DESC);
+
+-- =============================================================================
+-- Polymarket Prediction Markets (预测市场数据和分析)
+-- =============================================================================
+
+-- 预测市场表（缓存）
+CREATE TABLE IF NOT EXISTS qd_polymarket_markets (
+    id SERIAL PRIMARY KEY,
+    market_id VARCHAR(255) UNIQUE NOT NULL,
+    question TEXT,
+    category VARCHAR(100),  -- crypto, politics, economics, sports
+    current_probability DECIMAL(5,2),  -- YES概率（0-100）
+    volume_24h DECIMAL(20,2),
+    liquidity DECIMAL(20,2),
+    end_date_iso TIMESTAMP,
+    status VARCHAR(50),  -- active, closed, resolved
+    outcome_tokens JSONB,  -- YES/NO价格和交易量
+    slug VARCHAR(255),  -- Polymarket事件slug，用于构建URL
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_polymarket_category ON qd_polymarket_markets(category);
+CREATE INDEX IF NOT EXISTS idx_polymarket_status ON qd_polymarket_markets(status);
+CREATE INDEX IF NOT EXISTS idx_polymarket_updated ON qd_polymarket_markets(updated_at DESC);
+
+-- AI分析记录表
+CREATE TABLE IF NOT EXISTS qd_polymarket_ai_analysis (
+    id SERIAL PRIMARY KEY,
+    market_id VARCHAR(255) NOT NULL,
+    user_id INTEGER,  -- 可选：用户特定的分析
+    ai_predicted_probability DECIMAL(5,2),
+    market_probability DECIMAL(5,2),
+    divergence DECIMAL(5,2),  -- AI - 市场
+    recommendation VARCHAR(20),  -- YES/NO/HOLD
+    confidence_score DECIMAL(5,2),
+    opportunity_score DECIMAL(5,2),
+    reasoning TEXT,
+    key_factors JSONB,
+    related_assets TEXT[],  -- 相关资产列表
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_polymarket_analysis_market ON qd_polymarket_ai_analysis(market_id);
+CREATE INDEX IF NOT EXISTS idx_polymarket_analysis_opportunity ON qd_polymarket_ai_analysis(opportunity_score DESC);
+CREATE INDEX IF NOT EXISTS idx_polymarket_analysis_user ON qd_polymarket_ai_analysis(user_id);
+
+-- 资产交易机会表（基于预测市场生成）
+CREATE TABLE IF NOT EXISTS qd_polymarket_asset_opportunities (
+    id SERIAL PRIMARY KEY,
+    market_id VARCHAR(255) NOT NULL,
+    asset_symbol VARCHAR(100),
+    asset_market VARCHAR(50),
+    signal VARCHAR(20),  -- BUY/SELL/HOLD
+    confidence DECIMAL(5,2),
+    reasoning TEXT,
+    entry_suggestion JSONB,  -- 入场建议
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_polymarket_opp_market ON qd_polymarket_asset_opportunities(market_id);
+CREATE INDEX IF NOT EXISTS idx_polymarket_opp_asset ON qd_polymarket_asset_opportunities(asset_symbol, asset_market);
 
 -- =============================================================================
 -- Completion Notice

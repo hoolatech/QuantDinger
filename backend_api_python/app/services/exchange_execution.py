@@ -15,6 +15,7 @@ from typing import Any, Dict
 
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
+from app.utils.credential_crypto import decrypt_credential_blob
 
 logger = get_logger(__name__)
 
@@ -61,7 +62,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
         cur = db.cursor()
         cur.execute(
             """
-            SELECT id, exchange_config, trading_config, market_type, leverage, execution_mode, market_category
+            SELECT id, user_id, exchange_config, trading_config, market_type, leverage, execution_mode, market_category
             FROM qd_strategies_trading
             WHERE id = %s
             """,
@@ -77,9 +78,11 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
     leverage = float(row.get("leverage") or trading_config.get("leverage") or exchange_config.get("leverage") or 1.0)
     execution_mode = (row.get("execution_mode") or "signal").strip().lower()
     market_category = (row.get("market_category") or "Crypto").strip()
+    user_id = int(row.get("user_id") or 1)
 
     return {
         "strategy_id": int(strategy_id),
+        "user_id": user_id,
         "exchange_config": exchange_config if isinstance(exchange_config, dict) else {},
         "trading_config": trading_config if isinstance(trading_config, dict) else {},
         "market_type": market_type,
@@ -90,7 +93,7 @@ def load_strategy_configs(strategy_id: int) -> Dict[str, Any]:
 
 
 def _load_credential_config(credential_id: int, user_id: int = 1) -> Dict[str, Any]:
-    """Load credential JSON from qd_exchange_credentials (plaintext in local mode)."""
+    """Load credential JSON from qd_exchange_credentials (Fernet via SECRET_KEY)."""
     with get_db_connection() as db:
         cur = db.cursor()
         cur.execute(
@@ -103,7 +106,13 @@ def _load_credential_config(credential_id: int, user_id: int = 1) -> Dict[str, A
         )
         row = cur.fetchone() or {}
         cur.close()
-    return _safe_json_loads(row.get("encrypted_config"), {}) or {}
+    raw = row.get("encrypted_config")
+    try:
+        plain = decrypt_credential_blob(raw)
+    except ValueError as e:
+        logger.warning(f"decrypt credential_id={credential_id}: {e}")
+        return {}
+    return _safe_json_loads(plain, {}) or {}
 
 
 def resolve_exchange_config(exchange_config: Dict[str, Any], user_id: int = 1) -> Dict[str, Any]:

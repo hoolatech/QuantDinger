@@ -4,7 +4,7 @@ Flask-based backend for QuantDinger: market data, indicators, AI analysis, backt
 
 ## What you get
 
-- **Multi-market data layer**: factory-based providers (crypto / US stocks / CN&HK stocks / futures, etc.)
+- **Multi-market data layer**: factory-based providers (crypto / US stocks / forex / futures, etc.)
 - **Indicators + backtesting**: persisted runs/history in PostgreSQL
 - **AI multi-agent analysis**: optional web search + OpenRouter LLM integration
 - **Strategy runtime**: thread-based executor, with optional auto-restore on startup
@@ -177,27 +177,26 @@ POST /api/users/change-password - Change own password
 ```text
 GET  /api/health
 GET  /api/indicator/kline
-POST /api/analysis/multi
+POST /api/fast-analysis/analyze    - Fast AI analysis (main entry)
+GET  /api/fast-analysis/history    - Analysis history
+GET  /api/fast-analysis/similar-patterns - RAG similar patterns
+POST /api/fast-analysis/feedback   - User feedback on analysis
 ```
 
-## AI memory augmentation
+## AI analysis & memory
 
-This backend includes a lightweight, privacy-first **memory-augmented multi-agent** system:
+Uses **FastAnalysisService** (single LLM call, multi-factor):
 
-- Memory DBs stored in PostgreSQL
-- API hooks:
-  - `POST /api/analysis/multi` (main entry)
-  - `POST /api/analysis/reflect` (manual learn from post-trade outcomes)
-- Controls in `.env`:
-  - `ENABLE_AGENT_MEMORY`, `AGENT_MEMORY_*`
-  - `ENABLE_REFLECTION_WORKER`, `REFLECTION_WORKER_INTERVAL_SEC`
+- Memory: `qd_analysis_memory` in PostgreSQL
+- API: `POST /api/fast-analysis/analyze` (main), `/history`, `/similar-patterns`, `/feedback`
+- Calibration: `AICalibrationService` tunes BUY/SELL thresholds from validated outcomes
 
 ## Frontend integration
 
-For Vue dev server:
-- Frontend: `http://localhost:8000`
+For local Vue dev (private frontend repo):
+- Frontend dev server URL depends on your `vue.config.js` / Vite config
 - Backend: `http://localhost:5000`
-- Proxy config: `quantdinger_vue/vue.config.js`
+- Point devServer proxy at the backend URL above
 
 ## Production (Gunicorn)
 
@@ -208,7 +207,7 @@ gunicorn -c gunicorn_config.py "run:app"
 ## Troubleshooting
 
 - **Database connection failed**: Check `DATABASE_URL` format and PostgreSQL service status
-- **Outbound requests fail**: Configure `PROXY_PORT` or `PROXY_URL` in `.env`
+- **Outbound requests fail**: Configure `PROXY_URL` in `.env`
 - **Disable auto-restore**: Set `DISABLE_RESTORE_RUNNING_STRATEGIES=true`
 - **Disable pending-order worker**: Set `ENABLE_PENDING_ORDER_WORKER=false`
 

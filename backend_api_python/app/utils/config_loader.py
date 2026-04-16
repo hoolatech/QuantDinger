@@ -69,7 +69,6 @@ def load_addon_config() -> Dict[str, Any]:
         ('OPENROUTER_MAX_TOKENS', 'openrouter.max_tokens', 'int'),
         ('OPENROUTER_TIMEOUT', 'openrouter.timeout', 'int'),
         ('OPENROUTER_CONNECT_TIMEOUT', 'openrouter.connect_timeout', 'int'),
-        ('AI_MODELS_JSON', 'ai.models', 'json'),
         
         # OpenAI Direct
         ('OPENAI_API_KEY', 'openai.api_key', 'string'),
@@ -94,11 +93,9 @@ def load_addon_config() -> Dict[str, Any]:
         ('LLM_PROVIDER', 'llm.provider', 'string'),
 
         # App
-        ('CORS_ORIGINS', 'app.cors_origins', 'string'),
         ('RATE_LIMIT', 'app.rate_limit', 'int'),
         ('ENABLE_CACHE', 'app.enable_cache', 'bool'),
         ('ENABLE_REQUEST_LOG', 'app.enable_request_log', 'bool'),
-        ('ENABLE_AI_ANALYSIS', 'app.enable_ai_analysis', 'bool'),
 
         # Data source common
         ('DATA_SOURCE_TIMEOUT', 'data_source.timeout', 'int'),
@@ -110,16 +107,20 @@ def load_addon_config() -> Dict[str, Any]:
         ('FINNHUB_TIMEOUT', 'finnhub.timeout', 'int'),
         ('FINNHUB_RATE_LIMIT', 'finnhub.rate_limit', 'int'),
 
+        # Crypto analytics
+        ('COINGLASS_API_KEY', 'coinglass.api_key', 'string'),
+        ('CRYPTOQUANT_API_KEY', 'cryptoquant.api_key', 'string'),
+
         # CCXT
         ('CCXT_DEFAULT_EXCHANGE', 'ccxt.default_exchange', 'string'),
         ('CCXT_TIMEOUT', 'ccxt.timeout', 'int'),
-        ('CCXT_PROXY', 'ccxt.proxy', 'string'),
 
         # Other sources
         ('YFINANCE_TIMEOUT', 'yfinance.timeout', 'int'),
         ('AKSHARE_TIMEOUT', 'akshare.timeout', 'int'),
         ('TIINGO_API_KEY', 'tiingo.api_key', 'string'),
         ('TIINGO_TIMEOUT', 'tiingo.timeout', 'int'),
+        ('TWELVE_DATA_API_KEY', 'twelve_data.api_key', 'string'),
 
         # Search (Google CSE / Bing)
         ('SEARCH_PROVIDER', 'search.provider', 'string'),
@@ -130,9 +131,6 @@ def load_addon_config() -> Dict[str, Any]:
         
         # Tavily (AI-optimized search)
         ('TAVILY_API_KEYS', 'tavily.api_keys', 'string'),
-        
-        # Bocha (Chinese search optimization)
-        ('BOCHA_API_KEYS', 'bocha.api_keys', 'string'),
         
         # SerpAPI (Google/Bing scraper)
         ('SERPAPI_KEYS', 'serpapi.api_keys', 'string'),

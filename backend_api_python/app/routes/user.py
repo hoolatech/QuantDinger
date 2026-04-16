@@ -4,14 +4,36 @@ User Management API Routes
 Provides endpoints for user CRUD operations, role management, etc.
 Only accessible by admin users.
 """
+import csv
 import json
-from flask import Blueprint, request, jsonify, g
+from io import StringIO
+import re
+from flask import Blueprint, request, jsonify, g, Response
 from app.services.user_service import get_user_service
 from app.utils.auth import login_required, admin_required
 from app.utils.db import get_db_connection
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+_PROFILE_TIMEZONE_RE = re.compile(r'^[A-Za-z0-9_/+\-.]+$')
+
+
+def _ensure_chart_templates_column():
+    """Add qd_users.chart_templates when upgrading existing databases."""
+    try:
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute(
+                """
+                ALTER TABLE qd_users
+                ADD COLUMN IF NOT EXISTS chart_templates TEXT DEFAULT ''
+                """
+            )
+            db.commit()
+            cur.close()
+    except Exception as e:
+        logger.warning(f"ensure chart_templates column skipped: {e}")
 
 user_bp = Blueprint('user_manage', __name__)
 
@@ -43,6 +65,54 @@ def list_users():
         })
     except Exception as e:
         logger.error(f"list_users failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/export', methods=['GET'])
+@login_required
+@admin_required
+def export_users():
+    """Export all users as an Excel-friendly CSV file (admin only)."""
+    try:
+        search = request.args.get('search', '', type=str)
+        users = get_user_service().list_all_users_for_export(search=search)
+
+        output = StringIO()
+        output.write('\ufeff')
+        writer = csv.writer(output)
+        writer.writerow([
+            'ID', 'Username', 'Email', 'Nickname', 'Role', 'Status',
+            'Credits', 'VIP Expires At', 'Timezone', 'Register IP',
+            'Last Login At', 'Created At', 'Updated At'
+        ])
+
+        for user in users:
+            writer.writerow([
+                user.get('id') or '',
+                user.get('username') or '',
+                user.get('email') or '',
+                user.get('nickname') or '',
+                user.get('role') or '',
+                user.get('status') or '',
+                user.get('credits') or 0,
+                user.get('vip_expires_at') or '',
+                user.get('timezone') or '',
+                user.get('register_ip') or '',
+                user.get('last_login_at') or '',
+                user.get('created_at') or '',
+                user.get('updated_at') or '',
+            ])
+
+        filename = 'quantdinger_users_export.csv'
+        return Response(
+            output.getvalue(),
+            mimetype='text/csv; charset=utf-8',
+            headers={
+                'Content-Disposition': f'attachment; filename="{filename}"'
+            }
+        )
+    except Exception as e:
+        logger.error(f"export_users failed: {e}", exc_info=True)
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
@@ -411,6 +481,7 @@ def update_profile():
     Request body:
         nickname: str (optional)
         avatar: str (optional)
+        timezone: str (optional, IANA id; empty = follow client)
     
     Note: Email cannot be changed after registration (for security).
           Only admin can change user email via User Management.
@@ -428,6 +499,16 @@ def update_profile():
         for field in ['nickname', 'avatar']:
             if field in data:
                 allowed[field] = data[field]
+        
+        if 'timezone' in data:
+            tz = (data.get('timezone') or '').strip()
+            if tz and (len(tz) > 64 or not _PROFILE_TIMEZONE_RE.match(tz)):
+                return jsonify({
+                    'code': 0,
+                    'msg': 'Invalid timezone identifier',
+                    'data': None
+                }), 400
+            allowed['timezone'] = tz
         
         if not allowed:
             return jsonify({'code': 0, 'msg': 'No valid fields to update', 'data': None}), 400
@@ -650,6 +731,7 @@ def update_notification_settings():
             'email': str(data.get('email') or '').strip(),
             'discord_webhook': str(data.get('discord_webhook') or '').strip(),
             'webhook_url': str(data.get('webhook_url') or '').strip(),
+            'webhook_token': str(data.get('webhook_token') or '').strip(),
             'phone': str(data.get('phone') or '').strip(),
         }
         
@@ -674,6 +756,270 @@ def update_notification_settings():
         })
     except Exception as e:
         logger.error(f"update_notification_settings failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/chart-templates', methods=['GET'])
+@login_required
+def get_chart_templates():
+    """Get current user's indicator chart templates."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        _ensure_chart_templates_column()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT chart_templates FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            cur.close()
+
+        raw = (row.get('chart_templates') if row else '') or ''
+        templates = []
+        if raw:
+            try:
+                templates = json.loads(raw)
+            except Exception:
+                templates = []
+        if not isinstance(templates, list):
+            templates = []
+
+        templates = sorted(
+            [tpl for tpl in templates if isinstance(tpl, dict)],
+            key=lambda x: str(x.get('updated_at') or ''),
+            reverse=True
+        )
+        return jsonify({'code': 1, 'msg': 'success', 'data': templates})
+    except Exception as e:
+        logger.error(f"get_chart_templates failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/chart-templates', methods=['POST'])
+@login_required
+def save_chart_template():
+    """Create or update a user's indicator chart template."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        data = request.get_json() or {}
+        name = str(data.get('name') or '').strip()
+        template_id = str(data.get('template_id') or '').strip()
+        indicators = data.get('indicators') or []
+
+        if not name:
+            return jsonify({'code': 0, 'msg': 'Template name is required', 'data': None}), 400
+        if len(name) > 80:
+            return jsonify({'code': 0, 'msg': 'Template name is too long', 'data': None}), 400
+        if not isinstance(indicators, list):
+            return jsonify({'code': 0, 'msg': 'Indicators must be a list', 'data': None}), 400
+
+        sanitized = []
+        for item in indicators:
+            if not isinstance(item, dict):
+                continue
+            indicator_id = str(item.get('id') or '').strip()
+            instance_id = str(item.get('instanceId') or '').strip()
+            indicator_type = str(item.get('type') or '').strip()
+            if not indicator_id or not instance_id or not indicator_type:
+                continue
+            params = item.get('params') if isinstance(item.get('params'), dict) else {}
+            style = item.get('style') if isinstance(item.get('style'), dict) else {}
+            sanitized.append({
+                'id': indicator_id,
+                'instanceId': instance_id,
+                'name': str(item.get('name') or '').strip(),
+                'shortName': str(item.get('shortName') or '').strip(),
+                'type': indicator_type,
+                'visible': bool(item.get('visible', True)),
+                'params': params,
+                'style': {
+                    'color': str(style.get('color') or '').strip(),
+                    'lineWidth': int(style.get('lineWidth') or 2)
+                }
+            })
+
+        now_iso = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        _ensure_chart_templates_column()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT chart_templates FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            raw = (row.get('chart_templates') if row else '') or ''
+            templates = []
+            if raw:
+                try:
+                    templates = json.loads(raw)
+                except Exception:
+                    templates = []
+            if not isinstance(templates, list):
+                templates = []
+
+            saved = None
+            updated_templates = []
+            if template_id:
+                for tpl in templates:
+                    if isinstance(tpl, dict) and str(tpl.get('id') or '') == template_id:
+                        tpl = {
+                            **tpl,
+                            'id': template_id,
+                            'name': name,
+                            'indicators': sanitized,
+                            'updated_at': now_iso
+                        }
+                        saved = tpl
+                    updated_templates.append(tpl)
+            else:
+                updated_templates = [tpl for tpl in templates if isinstance(tpl, dict)]
+
+            if saved is None:
+                saved = {
+                    'id': f"tpl_{int(time.time() * 1000)}",
+                    'name': name,
+                    'indicators': sanitized,
+                    'created_at': now_iso,
+                    'updated_at': now_iso
+                }
+                updated_templates.append(saved)
+
+            updated_templates = sorted(updated_templates, key=lambda x: str(x.get('updated_at') or ''), reverse=True)[:20]
+            cur.execute(
+                "UPDATE qd_users SET chart_templates = ?, updated_at = NOW() WHERE id = ?",
+                (json.dumps(updated_templates, ensure_ascii=False), user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'Chart template saved', 'data': saved})
+    except Exception as e:
+        logger.error(f"save_chart_template failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/chart-templates', methods=['DELETE'])
+@login_required
+def delete_chart_template():
+    """Delete a user's chart template by id."""
+    try:
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        template_id = str(request.args.get('template_id') or '').strip()
+        if not template_id:
+            return jsonify({'code': 0, 'msg': 'template_id is required', 'data': None}), 400
+
+        _ensure_chart_templates_column()
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT chart_templates FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            raw = (row.get('chart_templates') if row else '') or ''
+            templates = []
+            if raw:
+                try:
+                    templates = json.loads(raw)
+                except Exception:
+                    templates = []
+            if not isinstance(templates, list):
+                templates = []
+
+            updated_templates = [
+                tpl for tpl in templates
+                if not (isinstance(tpl, dict) and str(tpl.get('id') or '') == template_id)
+            ]
+            cur.execute(
+                "UPDATE qd_users SET chart_templates = ?, updated_at = NOW() WHERE id = ?",
+                (json.dumps(updated_templates, ensure_ascii=False), user_id)
+            )
+            db.commit()
+            cur.close()
+
+        return jsonify({'code': 1, 'msg': 'Chart template deleted', 'data': {'template_id': template_id}})
+    except Exception as e:
+        logger.error(f"delete_chart_template failed: {e}")
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+@user_bp.route('/notification-settings/test', methods=['POST'])
+@login_required
+def test_notification_settings():
+    """
+    Send a test notification using the current user's saved notification_settings
+    (save settings first via PUT /notification-settings).
+    """
+    try:
+        import json
+        from app.services.signal_notifier import SignalNotifier
+        from app.utils.db import get_db_connection
+
+        user_id = getattr(g, 'user_id', None)
+        if not user_id:
+            return jsonify({'code': 0, 'msg': 'Not authenticated', 'data': None}), 401
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+            cur.execute("SELECT notification_settings, email FROM qd_users WHERE id = ?", (user_id,))
+            row = cur.fetchone()
+            cur.close()
+
+        if not row:
+            return jsonify({'code': 0, 'msg': 'User not found', 'data': None}), 404
+
+        settings_str = row.get('notification_settings') or ''
+        account_email = (row.get('email') or '').strip()
+        settings = {}
+        if settings_str:
+            try:
+                settings = json.loads(settings_str)
+            except Exception:
+                settings = {}
+
+        channels = settings.get('default_channels') or ['browser']
+        if not isinstance(channels, list) or not channels:
+            channels = ['browser']
+
+        notify_email = (settings.get('email') or '').strip() or account_email
+        targets = {
+            'telegram': (settings.get('telegram_chat_id') or '').strip(),
+            'telegram_bot_token': (settings.get('telegram_bot_token') or '').strip(),
+            'email': notify_email,
+            'phone': (settings.get('phone') or '').strip(),
+            'discord': (settings.get('discord_webhook') or '').strip(),
+            'webhook': (settings.get('webhook_url') or '').strip(),
+            'webhook_token': (settings.get('webhook_token') or '').strip(),
+        }
+
+        accept = (request.headers.get('Accept-Language') or '') + ' ' + (request.headers.get('X-Locale') or '')
+        language = 'zh-CN' if 'zh' in accept.lower() else 'en-US'
+
+        notifier = SignalNotifier()
+        results = notifier.send_profile_test_notifications(
+            user_id=int(user_id),
+            channels=channels,
+            targets=targets,
+            language=language,
+        )
+
+        any_ok = any((v or {}).get('ok') for v in results.values())
+        failed = [k for k, v in results.items() if not (v or {}).get('ok')]
+        if failed:
+            err_detail = {k: (results.get(k) or {}).get('error', '') for k in failed}
+            logger.warning("notification_settings test: user_id=%s failed_channels=%s errors=%s", user_id, failed, err_detail)
+
+        if not any_ok:
+            detail = '; '.join(f"{k}: {(results[k] or {}).get('error', '')}" for k in failed) or 'all channels failed'
+            return jsonify({'code': 0, 'msg': detail, 'data': {'results': results}})
+
+        msg = 'Test notification sent'
+        if failed:
+            msg = f"Sent OK; failed: {', '.join(failed)}"
+        return jsonify({'code': 1, 'msg': msg, 'data': {'results': results}})
+    except Exception as e:
+        logger.error(f"test_notification_settings failed: {e}")
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
 
 
@@ -779,15 +1125,47 @@ def get_system_strategies():
         page: int (default 1)
         page_size: int (default 20, max 100)
         status: str (optional, filter by status: running/stopped/all)
+        execution_mode: str (optional, live/signal — omit or all for any)
         search: str (optional, search by strategy name/symbol/username)
+        sort_by: str (optional, whitelist; default status+updated_at)
+        sort_order: str (optional, asc or desc; default desc when sort_by set)
     """
     try:
         page = request.args.get('page', 1, type=int)
         page_size = request.args.get('page_size', 20, type=int)
         status_filter = request.args.get('status', '', type=str).strip().lower()
+        execution_filter = request.args.get('execution_mode', '', type=str).strip().lower()
         search = request.args.get('search', '', type=str).strip()
+        sort_by = request.args.get('sort_by', '', type=str).strip().lower()
+        sort_order = request.args.get('sort_order', 'desc', type=str).strip().lower()
+        if sort_order not in ('asc', 'desc'):
+            sort_order = 'desc'
         page_size = min(100, max(1, page_size))
         offset = (page - 1) * page_size
+
+        sort_sql_map = {
+            'id': 's.id',
+            'updated_at': 's.updated_at',
+            'created_at': 's.created_at',
+            'initial_capital': 's.initial_capital',
+            'strategy_name': 's.strategy_name',
+            'symbol': 's.symbol',
+            'status': 's.status',
+            'execution_mode': 's.execution_mode',
+            'leverage': 's.leverage',
+        }
+        sort_expr_map = {
+            'total_pnl': (
+                "(COALESCE((SELECT SUM(unrealized_pnl) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0)"
+                " + COALESCE((SELECT SUM(profit) FROM qd_strategy_trades t WHERE t.strategy_id = s.id), 0))"
+            ),
+            'trade_count': '(SELECT COUNT(*) FROM qd_strategy_trades t WHERE t.strategy_id = s.id)',
+            'position_count': '(SELECT COUNT(*) FROM qd_strategy_positions p WHERE p.strategy_id = s.id)',
+            'total_equity': (
+                'COALESCE((SELECT SUM(equity) FROM qd_strategy_positions p WHERE p.strategy_id = s.id), 0)'
+            ),
+        }
+        direction = 'ASC' if sort_order == 'asc' else 'DESC'
 
         with get_db_connection() as db:
             cur = db.cursor()
@@ -800,6 +1178,10 @@ def get_system_strategies():
                 conditions.append("s.status = ?")
                 params.append(status_filter)
 
+            if execution_filter in ('live', 'signal'):
+                conditions.append("s.execution_mode = ?")
+                params.append(execution_filter)
+
             if search:
                 conditions.append(
                     "(s.strategy_name ILIKE ? OR s.symbol ILIKE ? OR u.username ILIKE ? OR u.nickname ILIKE ?)"
@@ -810,6 +1192,13 @@ def get_system_strategies():
             where_clause = ""
             if conditions:
                 where_clause = "WHERE " + " AND ".join(conditions)
+
+            if sort_by in sort_sql_map:
+                order_clause = f"ORDER BY {sort_sql_map[sort_by]} {direction}, s.id DESC"
+            elif sort_by in sort_expr_map:
+                order_clause = f"ORDER BY {sort_expr_map[sort_by]} {direction}, s.id DESC"
+            else:
+                order_clause = "ORDER BY s.status DESC, s.updated_at DESC, s.id DESC"
 
             # Get total count
             count_sql = f"""
@@ -828,6 +1217,7 @@ def get_system_strategies():
                     s.user_id,
                     s.strategy_name,
                     s.strategy_type,
+                    s.strategy_mode,
                     s.market_category,
                     s.execution_mode,
                     s.status,
@@ -847,7 +1237,7 @@ def get_system_strategies():
                 FROM qd_strategies_trading s
                 LEFT JOIN qd_users u ON u.id = s.user_id
                 {where_clause}
-                ORDER BY s.status DESC, s.updated_at DESC
+                {order_clause}
                 LIMIT ? OFFSET ?
             """
             cur.execute(query_sql, tuple(params) + (page_size, offset))
@@ -911,6 +1301,16 @@ def get_system_strategies():
             indicator_name = ''
             if isinstance(indicator_config, dict):
                 indicator_name = indicator_config.get('indicator_name') or indicator_config.get('name') or ''
+            if not indicator_name and str(s.get('strategy_mode') or '').strip().lower() == 'bot':
+                if isinstance(trading_config, dict):
+                    indicator_name = (
+                        trading_config.get('bot_name')
+                        or s.get('strategy_name')
+                        or trading_config.get('bot_type')
+                        or ''
+                    )
+                else:
+                    indicator_name = s.get('strategy_name') or ''
 
             # Extract exchange name
             exchange_name = ''
@@ -985,11 +1385,61 @@ def get_system_strategies():
                 'updated_at': updated_at
             })
 
-        # Compute summary stats
-        all_running = [i for i in items if i['status'] == 'running']
-        total_capital = sum(i['initial_capital'] for i in items)
-        total_system_pnl = sum(i['total_pnl'] for i in items)
-        total_running = len(all_running)
+        # Compute summary stats from all matched strategies (not just current page items).
+        with get_db_connection() as db:
+            cur = db.cursor()
+
+            # Aggregate strategy counts/capital by execution mode and running status.
+            agg_sql = f"""
+                SELECT
+                    COUNT(*) AS total_strategies,
+                    COALESCE(SUM(s.initial_capital), 0) AS total_capital,
+                    COALESCE(SUM(CASE WHEN s.status = 'running' THEN 1 ELSE 0 END), 0) AS running_strategies,
+                    COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN 1 ELSE 0 END), 0) AS live_strategies,
+                    COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN 1 ELSE 0 END), 0) AS signal_strategies,
+                    COALESCE(SUM(CASE WHEN s.status = 'running' AND s.execution_mode = 'live' THEN 1 ELSE 0 END), 0) AS running_live_strategies,
+                    COALESCE(SUM(CASE WHEN s.status = 'running' AND s.execution_mode = 'signal' THEN 1 ELSE 0 END), 0) AS running_signal_strategies,
+                    COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN s.initial_capital ELSE 0 END), 0) AS live_capital,
+                    COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN s.initial_capital ELSE 0 END), 0) AS signal_capital
+                FROM qd_strategies_trading s
+                LEFT JOIN qd_users u ON u.id = s.user_id
+                {where_clause}
+            """
+            cur.execute(agg_sql, tuple(params))
+            agg_row = cur.fetchone() or {}
+
+            # Aggregate unrealized pnl from current positions.
+            unreal_sql = f"""
+                SELECT COALESCE(SUM(p.unrealized_pnl), 0) AS total_unrealized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN p.unrealized_pnl ELSE 0 END), 0) AS live_unrealized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN p.unrealized_pnl ELSE 0 END), 0) AS signal_unrealized
+                FROM qd_strategy_positions p
+                JOIN qd_strategies_trading s ON s.id = p.strategy_id
+                LEFT JOIN qd_users u ON u.id = s.user_id
+                {where_clause}
+            """
+            cur.execute(unreal_sql, tuple(params))
+            unreal_row = cur.fetchone() or {}
+
+            # Aggregate realized pnl from trade history.
+            realized_sql = f"""
+                SELECT COALESCE(SUM(t.profit), 0) AS total_realized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'live' THEN t.profit ELSE 0 END), 0) AS live_realized,
+                       COALESCE(SUM(CASE WHEN s.execution_mode = 'signal' THEN t.profit ELSE 0 END), 0) AS signal_realized
+                FROM qd_strategy_trades t
+                JOIN qd_strategies_trading s ON s.id = t.strategy_id
+                LEFT JOIN qd_users u ON u.id = s.user_id
+                {where_clause}
+            """
+            cur.execute(realized_sql, tuple(params))
+            realized_row = cur.fetchone() or {}
+            cur.close()
+
+        total_capital = float(agg_row.get('total_capital') or 0)
+        total_running = int(agg_row.get('running_strategies') or 0)
+        total_system_pnl = float(unreal_row.get('total_unrealized') or 0) + float(realized_row.get('total_realized') or 0)
+        live_pnl = float(unreal_row.get('live_unrealized') or 0) + float(realized_row.get('live_realized') or 0)
+        signal_pnl = float(unreal_row.get('signal_unrealized') or 0) + float(realized_row.get('signal_realized') or 0)
 
         return jsonify({
             'code': 1,
@@ -1000,16 +1450,500 @@ def get_system_strategies():
                 'page': page,
                 'page_size': page_size,
                 'summary': {
-                    'total_strategies': total,
+                    'total_strategies': int(agg_row.get('total_strategies') or total),
                     'running_strategies': total_running,
                     'total_capital': round(total_capital, 2),
                     'total_pnl': round(total_system_pnl, 4),
-                    'total_roi': round((total_system_pnl / total_capital * 100) if total_capital > 0 else 0, 2)
+                    'total_roi': round((total_system_pnl / total_capital * 100) if total_capital > 0 else 0, 2),
+                    'live_strategies': int(agg_row.get('live_strategies') or 0),
+                    'signal_strategies': int(agg_row.get('signal_strategies') or 0),
+                    'running_live_strategies': int(agg_row.get('running_live_strategies') or 0),
+                    'running_signal_strategies': int(agg_row.get('running_signal_strategies') or 0),
+                    'live_capital': round(float(agg_row.get('live_capital') or 0), 2),
+                    'signal_capital': round(float(agg_row.get('signal_capital') or 0), 2),
+                    'live_pnl': round(live_pnl, 4),
+                    'signal_pnl': round(signal_pnl, 4)
                 }
             }
         })
     except Exception as e:
         logger.error(f"get_system_strategies failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+# ==================== Admin Orders ====================
+
+@user_bp.route('/admin-orders', methods=['GET'])
+@login_required
+@admin_required
+def get_admin_orders():
+    """
+    Get all orders across the system (admin only).
+    Merges qd_membership_orders and qd_usdt_orders into a unified list.
+
+    Query params:
+        page: int (default 1)
+        page_size: int (default 20, max 100)
+        status: str (optional, filter by status: paid/pending/confirmed/expired/all)
+        search: str (optional, search by username/email)
+    """
+    try:
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('page_size', 20, type=int)
+        status_filter = request.args.get('status', '', type=str).strip().lower()
+        search = request.args.get('search', '', type=str).strip()
+        page_size = min(100, max(1, page_size))
+        offset = (page - 1) * page_size
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+
+            # --- USDT Orders (primary) ---
+            usdt_conditions = []
+            usdt_params = []
+
+            if status_filter and status_filter != 'all':
+                usdt_conditions.append("o.status = ?")
+                usdt_params.append(status_filter)
+
+            if search:
+                usdt_conditions.append("(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ?)")
+                like_val = f"%{search}%"
+                usdt_params.extend([like_val, like_val, like_val])
+
+            usdt_where = ""
+            if usdt_conditions:
+                usdt_where = "WHERE " + " AND ".join(usdt_conditions)
+
+            # Count
+            cur.execute(
+                f"SELECT COUNT(*) as cnt FROM qd_usdt_orders o LEFT JOIN qd_users u ON u.id = o.user_id {usdt_where}",
+                tuple(usdt_params)
+            )
+            usdt_total = cur.fetchone()['cnt']
+
+            # --- Membership Orders (mock) ---
+            mock_conditions = []
+            mock_params = []
+
+            if status_filter and status_filter != 'all':
+                mock_conditions.append("m.status = ?")
+                mock_params.append(status_filter)
+
+            if search:
+                mock_conditions.append("(u.username ILIKE ? OR u.email ILIKE ? OR u.nickname ILIKE ?)")
+                like_val = f"%{search}%"
+                mock_params.extend([like_val, like_val, like_val])
+
+            mock_where = ""
+            if mock_conditions:
+                mock_where = "WHERE " + " AND ".join(mock_conditions)
+
+            cur.execute(
+                f"SELECT COUNT(*) as cnt FROM qd_membership_orders m LEFT JOIN qd_users u ON u.id = m.user_id {mock_where}",
+                tuple(mock_params)
+            )
+            mock_total = cur.fetchone()['cnt']
+
+            total = usdt_total + mock_total
+
+            # Use UNION ALL to merge both tables into one sorted list
+            # We select a unified schema
+            union_sql = f"""
+                SELECT * FROM (
+                    SELECT
+                        o.id,
+                        'usdt' AS order_type,
+                        o.user_id,
+                        u.username,
+                        u.nickname,
+                        u.email AS user_email,
+                        o.plan,
+                        o.amount_usdt AS amount,
+                        'USDT' AS currency,
+                        o.chain,
+                        o.address,
+                        o.tx_hash,
+                        o.status,
+                        o.created_at,
+                        o.paid_at,
+                        o.confirmed_at,
+                        o.expires_at
+                    FROM qd_usdt_orders o
+                    LEFT JOIN qd_users u ON u.id = o.user_id
+                    {usdt_where}
+
+                    UNION ALL
+
+                    SELECT
+                        m.id,
+                        'mock' AS order_type,
+                        m.user_id,
+                        u.username,
+                        u.nickname,
+                        u.email AS user_email,
+                        m.plan,
+                        m.price_usd AS amount,
+                        'USD' AS currency,
+                        '' AS chain,
+                        '' AS address,
+                        '' AS tx_hash,
+                        m.status,
+                        m.created_at,
+                        m.paid_at,
+                        NULL AS confirmed_at,
+                        NULL AS expires_at
+                    FROM qd_membership_orders m
+                    LEFT JOIN qd_users u ON u.id = m.user_id
+                    {mock_where}
+                ) AS combined
+                ORDER BY combined.created_at DESC
+                LIMIT ? OFFSET ?
+            """
+            all_params = list(usdt_params) + list(mock_params) + [page_size, offset]
+            cur.execute(union_sql, tuple(all_params))
+            rows = cur.fetchall() or []
+
+            # Summary stats
+            cur.execute(
+                f"""SELECT
+                    COUNT(*) AS total_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','confirmed') THEN 1 ELSE 0 END), 0) AS paid_orders,
+                    COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('expired','cancelled','failed') THEN 1 ELSE 0 END), 0) AS failed_orders,
+                    COALESCE(SUM(CASE WHEN status IN ('paid','confirmed') THEN amount_usdt ELSE 0 END), 0) AS total_revenue
+                FROM qd_usdt_orders"""
+            )
+            summary_row = cur.fetchone() or {}
+
+            cur.close()
+
+        items = []
+        for row in rows:
+            created_at = row.get('created_at')
+            paid_at = row.get('paid_at')
+            confirmed_at = row.get('confirmed_at')
+            expires_at = row.get('expires_at')
+            if hasattr(created_at, 'isoformat'):
+                created_at = created_at.isoformat()
+            if hasattr(paid_at, 'isoformat'):
+                paid_at = paid_at.isoformat()
+            if hasattr(confirmed_at, 'isoformat'):
+                confirmed_at = confirmed_at.isoformat()
+            if hasattr(expires_at, 'isoformat'):
+                expires_at = expires_at.isoformat()
+
+            items.append({
+                'id': row['id'],
+                'order_type': row.get('order_type') or '',
+                'user_id': row.get('user_id'),
+                'username': row.get('username') or '',
+                'nickname': row.get('nickname') or '',
+                'user_email': row.get('user_email') or '',
+                'plan': row.get('plan') or '',
+                'amount': float(row.get('amount') or 0),
+                'currency': row.get('currency') or '',
+                'chain': row.get('chain') or '',
+                'address': row.get('address') or '',
+                'tx_hash': row.get('tx_hash') or '',
+                'status': row.get('status') or '',
+                'created_at': created_at,
+                'paid_at': paid_at,
+                'confirmed_at': confirmed_at,
+                'expires_at': expires_at
+            })
+
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'items': items,
+                'total': total,
+                'page': page,
+                'page_size': page_size,
+                'summary': {
+                    'total_orders': int(summary_row.get('total_orders') or 0),
+                    'paid_orders': int(summary_row.get('paid_orders') or 0),
+                    'pending_orders': int(summary_row.get('pending_orders') or 0),
+                    'failed_orders': int(summary_row.get('failed_orders') or 0),
+                    'total_revenue': round(float(summary_row.get('total_revenue') or 0), 2)
+                }
+            }
+        })
+    except Exception as e:
+        logger.error(f"get_admin_orders failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
+
+
+# ==================== Admin AI Analysis Stats ====================
+
+@user_bp.route('/admin-ai-stats', methods=['GET'])
+@login_required
+@admin_required
+def get_admin_ai_stats():
+    """
+    Get AI analysis usage statistics across the system (admin only).
+    Does NOT expose analysis results, only aggregated counts/stats.
+
+    Query params:
+        page: int (default 1)
+        page_size: int (default 20, max 100)
+        search: str (optional, search by username)
+    """
+    try:
+        page = request.args.get('page', 1, type=int)
+        page_size = request.args.get('page_size', 20, type=int)
+        search = request.args.get('search', '', type=str).strip()
+        page_size = min(100, max(1, page_size))
+        offset = (page - 1) * page_size
+
+        with get_db_connection() as db:
+            cur = db.cursor()
+
+            # --- Overall summary (from qd_analysis_tasks + qd_analysis_memory) ---
+            cur.execute("""
+                SELECT
+                    COUNT(*) AS total_tasks,
+                    COUNT(DISTINCT user_id) AS unique_users,
+                    COUNT(DISTINCT symbol) AS unique_symbols,
+                    COUNT(DISTINCT market) AS unique_markets
+                FROM qd_analysis_tasks
+            """)
+            task_summary = cur.fetchone() or {}
+
+            memory_summary = {}
+            try:
+                cur.execute("""
+                    SELECT
+                        COUNT(*) AS total_memory,
+                        COALESCE(SUM(CASE WHEN was_correct = true THEN 1 ELSE 0 END), 0) AS correct_count,
+                        COALESCE(SUM(CASE WHEN was_correct = false THEN 1 ELSE 0 END), 0) AS incorrect_count,
+                        COALESCE(SUM(CASE WHEN user_feedback = 'helpful' THEN 1 ELSE 0 END), 0) AS helpful_count,
+                        COALESCE(SUM(CASE WHEN user_feedback = 'not_helpful' THEN 1 ELSE 0 END), 0) AS not_helpful_count
+                    FROM qd_analysis_memory
+                """)
+                memory_summary = cur.fetchone() or {}
+            except Exception as mem_err:
+                logger.warning(f"qd_analysis_memory query failed (table/column may not exist): {mem_err}")
+                db.rollback()
+                cur = db.cursor()  # re-create cursor after rollback
+                memory_summary = {}
+
+            # --- Per-user stats ---
+            # Build WHERE clause for user search (applied after JOIN)
+            user_where_clause = ""
+            user_params = []
+            if search:
+                user_where_clause = "WHERE (u.username ILIKE ? OR u.nickname ILIKE ? OR u.email ILIKE ?)"
+                like_val = f"%{search.strip()}%"
+                user_params = [like_val, like_val, like_val]
+
+            # Count distinct users who have analysis records (matching search criteria)
+            count_sql = f"""
+                SELECT COUNT(DISTINCT t.user_id) AS cnt
+                FROM qd_analysis_tasks t
+                LEFT JOIN qd_users u ON u.id = t.user_id
+                {user_where_clause}
+            """
+            cur.execute(count_sql, tuple(user_params))
+            count_result = cur.fetchone()
+            user_total = count_result['cnt'] if count_result else 0
+
+            # Get per-user aggregated stats
+            # Important: Filter by user search criteria AFTER grouping, but we need to apply it in WHERE
+            # Since we're grouping by user fields, we need to filter before GROUP BY
+            stats_sql = f"""
+                SELECT
+                    t.user_id,
+                    u.username,
+                    u.nickname,
+                    u.email,
+                    COUNT(*) AS analysis_count,
+                    COUNT(DISTINCT t.symbol) AS symbol_count,
+                    COUNT(DISTINCT t.market) AS market_count,
+                    MAX(t.created_at) AS last_analysis_at,
+                    MIN(t.created_at) AS first_analysis_at
+                FROM qd_analysis_tasks t
+                LEFT JOIN qd_users u ON u.id = t.user_id
+                {user_where_clause}
+                GROUP BY t.user_id, u.username, u.nickname, u.email
+                ORDER BY analysis_count DESC
+                LIMIT ? OFFSET ?
+            """
+            cur.execute(stats_sql, tuple(user_params) + (page_size, offset))
+            user_rows = cur.fetchall() or []
+
+            # Get per-user analysis_memory stats (correct/helpful counts)
+            user_ids = [r['user_id'] for r in user_rows if r.get('user_id')]
+            memory_stats_map = {}
+            if user_ids:
+                try:
+                    placeholders = ','.join(['?'] * len(user_ids))
+                    cur.execute(
+                        f"""
+                        SELECT
+                            user_id,
+                            COUNT(*) AS memory_count,
+                            COALESCE(SUM(CASE WHEN was_correct = true THEN 1 ELSE 0 END), 0) AS correct,
+                            COALESCE(SUM(CASE WHEN was_correct = false THEN 1 ELSE 0 END), 0) AS incorrect,
+                            COALESCE(SUM(CASE WHEN user_feedback = 'helpful' THEN 1 ELSE 0 END), 0) AS helpful,
+                            COALESCE(SUM(CASE WHEN user_feedback = 'not_helpful' THEN 1 ELSE 0 END), 0) AS not_helpful
+                        FROM qd_analysis_memory
+                        WHERE user_id IN ({placeholders})
+                        GROUP BY user_id
+                        """,
+                        tuple(user_ids)
+                    )
+                    for row in (cur.fetchall() or []):
+                        memory_stats_map[row['user_id']] = {
+                            'memory_count': row['memory_count'],
+                            'correct': row['correct'],
+                            'incorrect': row['incorrect'],
+                            'helpful': row['helpful'],
+                            'not_helpful': row['not_helpful']
+                        }
+                except Exception as mem_err:
+                    logger.warning(f"qd_analysis_memory per-user query failed: {mem_err}")
+                    db.rollback()
+                    cur = db.cursor()  # re-create cursor after rollback
+                    memory_stats_map = {}
+
+            # Get recent analysis records (last 50)
+            # Ensure we get user info even if user_id is NULL or user doesn't exist
+            cur.execute(
+                """
+                SELECT
+                    t.id,
+                    t.user_id,
+                    COALESCE(u.username, '') AS username,
+                    COALESCE(u.nickname, '') AS nickname,
+                    COALESCE(u.email, '') AS email,
+                    t.market,
+                    t.symbol,
+                    t.model,
+                    t.status,
+                    t.created_at,
+                    t.completed_at
+                FROM qd_analysis_tasks t
+                LEFT JOIN qd_users u ON u.id = t.user_id
+                WHERE t.user_id IS NOT NULL
+                ORDER BY t.created_at DESC
+                LIMIT 50
+                """
+            )
+            recent_rows = cur.fetchall() or []
+
+            cur.close()
+
+        # Build per-user items
+        user_items = []
+        for row in user_rows:
+            uid = row.get('user_id')
+            if not uid:  # Skip rows with NULL user_id
+                continue
+                
+            ms = memory_stats_map.get(uid, {})
+            last_at = row.get('last_analysis_at')
+            first_at = row.get('first_analysis_at')
+            
+            # Convert datetime to ISO format string if needed
+            if last_at and hasattr(last_at, 'isoformat'):
+                last_at = last_at.isoformat()
+            elif last_at:
+                last_at = str(last_at)
+            else:
+                last_at = None
+                
+            if first_at and hasattr(first_at, 'isoformat'):
+                first_at = first_at.isoformat()
+            elif first_at:
+                first_at = str(first_at)
+            else:
+                first_at = None
+
+            user_items.append({
+                'user_id': int(uid),
+                'username': str(row.get('username') or ''),
+                'nickname': str(row.get('nickname') or ''),
+                'email': str(row.get('email') or ''),
+                'analysis_count': int(row.get('analysis_count') or 0),
+                'symbol_count': int(row.get('symbol_count') or 0),
+                'market_count': int(row.get('market_count') or 0),
+                'correct': int(ms.get('correct', 0)),
+                'incorrect': int(ms.get('incorrect', 0)),
+                'helpful': int(ms.get('helpful', 0)),
+                'not_helpful': int(ms.get('not_helpful', 0)),
+                'last_analysis_at': last_at,
+                'first_analysis_at': first_at
+            })
+
+        # Build recent records
+        recent_items = []
+        for row in recent_rows:
+            user_id = row.get('user_id')
+            if not user_id:  # Skip rows with NULL user_id
+                continue
+                
+            created_at = row.get('created_at')
+            completed_at = row.get('completed_at')
+            
+            # Convert datetime to ISO format string if needed
+            if created_at and hasattr(created_at, 'isoformat'):
+                created_at = created_at.isoformat()
+            elif created_at:
+                created_at = str(created_at)
+            else:
+                created_at = None
+                
+            if completed_at and hasattr(completed_at, 'isoformat'):
+                completed_at = completed_at.isoformat()
+            elif completed_at:
+                completed_at = str(completed_at)
+            else:
+                completed_at = None
+
+            recent_items.append({
+                'id': int(row.get('id') or 0),
+                'user_id': int(user_id),
+                'username': str(row.get('username') or ''),
+                'nickname': str(row.get('nickname') or ''),
+                'email': str(row.get('email') or ''),
+                'market': str(row.get('market') or ''),
+                'symbol': str(row.get('symbol') or ''),
+                'model': str(row.get('model') or ''),
+                'status': str(row.get('status') or ''),
+                'created_at': created_at,
+                'completed_at': completed_at
+            })
+
+        return jsonify({
+            'code': 1,
+            'msg': 'success',
+            'data': {
+                'user_stats': user_items,
+                'user_total': user_total,
+                'page': page,
+                'page_size': page_size,
+                'recent': recent_items,
+                'summary': {
+                    'total_analyses': int(task_summary.get('total_tasks') or 0),
+                    'unique_users': int(task_summary.get('unique_users') or 0),
+                    'unique_symbols': int(task_summary.get('unique_symbols') or 0),
+                    'unique_markets': int(task_summary.get('unique_markets') or 0),
+                    'total_memory': int(memory_summary.get('total_memory') or 0),
+                    'correct_count': int(memory_summary.get('correct_count') or 0),
+                    'incorrect_count': int(memory_summary.get('incorrect_count') or 0),
+                    'helpful_count': int(memory_summary.get('helpful_count') or 0),
+                    'not_helpful_count': int(memory_summary.get('not_helpful_count') or 0)
+                }
+            }
+        })
+    except Exception as e:
+        logger.error(f"get_admin_ai_stats failed: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return jsonify({'code': 0, 'msg': str(e), 'data': None}), 500
